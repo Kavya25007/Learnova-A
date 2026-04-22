@@ -1,0 +1,125 @@
+Upgrade my Smart Notes Generator web app with a clean, modern, and premium UI design AND provide full project code files ready for GitHub.
+
+----------------------------
+UI DESIGN IMPROVEMENTS:
+----------------------------
+- Use a modern color palette (soft gradient background)
+- Example colors:
+  - Primary: #667eea
+  - Secondary: #764ba2
+  - Background: light gradient or dark mode option
+- Use rounded cards (border-radius: 12px+)
+- Add shadows for depth (box-shadow)
+- Maintain proper spacing and padding
+
+----------------------------
+LAYOUT:
+----------------------------
+Create a clean layout with sections:
+
+1. Header:
+- App name: “Smart Notes AI”
+- Minimal clean navbar
+
+2. Input Section (Card style):
+- YouTube link input
+- OR video upload
+- Interval selector (3,5,10 + custom input)
+- Mode toggle (Exact / Smart)
+- Generate button (highlighted)
+
+3. Progress Section:
+- Show loading spinner or progress bar
+
+4. Output Section:
+- Notes displayed in clean cards
+- Proper headings, bullet points, code blocks
+- Scrollable container
+
+----------------------------
+INTERACTIONS:
+----------------------------
+- Add hover effects on buttons
+- Smooth transitions
+- Button click animations
+- Fade-in notes when loaded
+
+----------------------------
+FEATURE FIXES:
+----------------------------
+- Only one input at a time (link OR upload)
+- Add custom interval input (2–15 sec)
+- Default interval: 5 sec
+- Add hint text: “Recommended: 5 seconds”
+
+----------------------------
+FILES REQUIRED:
+----------------------------
+Provide full code in separate files:
+
+Frontend:
+- index.html
+- style.css
+- script.js
+
+Backend (Python):
+- app.py
+
+Also include:
+- requirements.txt
+- README.md (how to run project)
+
+----------------------------
+BACKEND LOGIC:
+----------------------------
+- Accept YouTube link
+- Download video automatically
+- Extract frames at interval
+- OCR text extraction
+- Remove duplicate frames
+- Send cleaned text to AI
+- Return structured notes
+
+----------------------------
+OUTPUT:
+----------------------------
+- Clean structured notes
+- No repetition
+- Proper formatting
+
+----------------------------
+GOAL:
+----------------------------
+Make it look like a premium SaaS product, not a basic project.
+
+IMPORTANT:
+Return complete working code for ALL files separately so I can directly upload to GitHub.
+
+
+Add a new feature to my Smart Notes Generator:
+
+1. Add a mode selection:
+- Full Video Notes
+- Custom Time Range
+
+2. If Custom Time Range is selected:
+- Allow user to input Start Time and End Time (in mm:ss format)
+
+3. Process only the selected portion of the video:
+- Extract frames only within that time range
+- Apply OCR and AI notes generation only on that segment
+
+4. Combine with interval selection:
+- Frames should be captured at user-defined intervals within the selected range
+
+5. UI updates:
+- Add toggle for Full Video vs Custom Range
+- Show Start/End input fields only when Custom is selected
+
+6. Ensure:
+- No unnecessary processing outside selected range
+- Clean and structured notes output
+
+Goal:
+Give users flexibility to generate notes from either the full video or a specific portion of the video.
+

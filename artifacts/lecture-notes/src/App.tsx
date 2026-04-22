@@ -98,6 +98,26 @@ function downloadFile(name: string, content: string, type = "text/markdown") {
   URL.revokeObjectURL(url);
 }
 
+function parseTime(s: string): number | null {
+  if (!s) return null;
+  const parts = s.trim().split(":").map((p) => p.trim());
+  if (parts.some((p) => p === "" || !/^\d+$/.test(p))) return null;
+  let total = 0;
+  if (parts.length === 1) total = Number(parts[0]);
+  else if (parts.length === 2) total = Number(parts[0]) * 60 + Number(parts[1]);
+  else if (parts.length === 3)
+    total = Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]);
+  else return null;
+  return Number.isFinite(total) ? total : null;
+}
+
+function formatTime(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
 export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string>("");
@@ -105,6 +125,9 @@ export default function App() {
   const [interval, setInterval] = useState<number>(5);
   const [mode, setMode] = useState<Mode>("smart");
   const [title, setTitle] = useState<string>("");
+  const [rangeMode, setRangeMode] = useState<"full" | "custom">("full");
+  const [startTime, setStartTime] = useState<string>("00:00");
+  const [endTime, setEndTime] = useState<string>("00:30");
 
   const [frames, setFrames] = useState<Frame[]>([]);
   const [processing, setProcessing] = useState(false);
@@ -199,8 +222,33 @@ export default function App() {
     const ctx = canvas.getContext("2d")!;
 
     const duration = video.duration;
-    const steps = Math.max(1, Math.floor(duration / interval));
-    setPhase(`Capturing frames every ${interval}s`);
+
+    let startSec = 0;
+    let endSec = duration;
+    if (rangeMode === "custom") {
+      const s = parseTime(startTime);
+      const e = parseTime(endTime);
+      if (s == null || e == null) {
+        alert("Enter start and end times as mm:ss (e.g. 01:30).");
+        setProcessing(false);
+        return;
+      }
+      if (e <= s) {
+        alert("End time must be greater than start time.");
+        setProcessing(false);
+        return;
+      }
+      startSec = Math.max(0, Math.min(s, duration - 0.1));
+      endSec = Math.max(startSec + interval, Math.min(e, duration));
+    }
+
+    const span = Math.max(0, endSec - startSec);
+    const steps = Math.max(1, Math.floor(span / interval));
+    setPhase(
+      rangeMode === "custom"
+        ? `Capturing frames every ${interval}s from ${formatTime(startSec)} to ${formatTime(endSec)}`
+        : `Capturing frames every ${interval}s`,
+    );
 
     video.pause();
     video.muted = true;
@@ -222,7 +270,8 @@ export default function App() {
 
     for (let i = 0; i <= steps; i++) {
       if (cancelRef.current) break;
-      const t = Math.min(i * interval, duration - 0.05);
+      const t = Math.min(startSec + i * interval, endSec - 0.05, duration - 0.05);
+      if (t < startSec) continue;
       await seekTo(t);
       // give the browser a tick to paint
       await new Promise((r) => requestAnimationFrame(() => r(null)));
@@ -605,6 +654,87 @@ export default function App() {
                   </button>
                 </div>
               </div>
+            </div>
+
+            <div className="mt-4">
+              <label className="text-xs text-muted-foreground">Video range</label>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setRangeMode("full")}
+                  className={classNames(
+                    "px-3 py-2 rounded-lg text-sm border transition text-left",
+                    rangeMode === "full"
+                      ? "bg-primary text-primary-foreground border-primary shadow"
+                      : "bg-card border-border hover:bg-secondary",
+                  )}
+                >
+                  <div className="font-medium">Full Video Notes</div>
+                  <p
+                    className={classNames(
+                      "text-[11px] mt-0.5",
+                      rangeMode === "full"
+                        ? "text-primary-foreground/85"
+                        : "text-muted-foreground",
+                    )}
+                  >
+                    Process the entire video
+                  </p>
+                </button>
+                <button
+                  onClick={() => setRangeMode("custom")}
+                  className={classNames(
+                    "px-3 py-2 rounded-lg text-sm border transition text-left",
+                    rangeMode === "custom"
+                      ? "bg-accent text-accent-foreground border-accent shadow"
+                      : "bg-card border-border hover:bg-secondary",
+                  )}
+                >
+                  <div className="font-medium">Custom Time Range</div>
+                  <p
+                    className={classNames(
+                      "text-[11px] mt-0.5",
+                      rangeMode === "custom"
+                        ? "text-accent-foreground/85"
+                        : "text-muted-foreground",
+                    )}
+                  >
+                    Process only a selected portion
+                  </p>
+                </button>
+              </div>
+              {rangeMode === "custom" && (
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] text-muted-foreground">
+                      Start (mm:ss)
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={startTime}
+                      onChange={(e) => setStartTime(e.target.value)}
+                      placeholder="00:00"
+                      className="mt-1 w-full px-3 py-2 rounded-lg bg-card border border-border outline-none focus:ring-2 focus:ring-ring text-sm font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-muted-foreground">
+                      End (mm:ss)
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={endTime}
+                      onChange={(e) => setEndTime(e.target.value)}
+                      placeholder="01:30"
+                      className="mt-1 w-full px-3 py-2 rounded-lg bg-card border border-border outline-none focus:ring-2 focus:ring-ring text-sm font-mono"
+                    />
+                  </div>
+                  <p className="col-span-2 text-[11px] text-muted-foreground">
+                    Frames will be captured every {interval}s within this range only.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="mt-4 flex flex-wrap gap-2">
