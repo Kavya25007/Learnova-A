@@ -1,0 +1,172 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --font-sans: var(--app-font-sans);
+  --font-mono: var(--app-font-mono);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --background: 240 20% 98%;
+  --foreground: 240 15% 12%;
+  --border: 240 10% 90%;
+  --input: 240 10% 90%;
+  --ring: 258 90% 60%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 240 15% 12%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 240 15% 12%;
+
+  --primary: 258 90% 60%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 240 10% 95%;
+  --secondary-foreground: 240 15% 18%;
+
+  --muted: 240 10% 95%;
+  --muted-foreground: 240 8% 45%;
+
+  --accent: 196 90% 50%;
+  --accent-foreground: 0 0% 100%;
+
+  --destructive: 0 75% 55%;
+  --destructive-foreground: 0 0% 100%;
+
+  --app-font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --app-font-mono: 'JetBrains Mono', Menlo, monospace;
+  --radius: 0.625rem;
+}
+
+.dark {
+  --background: 240 18% 8%;
+  --foreground: 240 10% 96%;
+  --border: 240 10% 18%;
+  --input: 240 10% 18%;
+  --ring: 258 90% 65%;
+
+  --card: 240 18% 11%;
+  --card-foreground: 240 10% 96%;
+
+  --popover: 240 18% 11%;
+  --popover-foreground: 240 10% 96%;
+
+  --primary: 258 90% 65%;
+  --primary-foreground: 240 18% 8%;
+
+  --secondary: 240 12% 16%;
+  --secondary-foreground: 240 10% 96%;
+
+  --muted: 240 12% 16%;
+  --muted-foreground: 240 8% 65%;
+
+  --accent: 196 85% 55%;
+  --accent-foreground: 240 18% 8%;
+
+  --destructive: 0 70% 55%;
+  --destructive-foreground: 0 0% 100%;
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+  body {
+    @apply font-sans antialiased;
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+  }
+}
+
+.app-bg {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, hsl(258 90% 60% / 0.10), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, hsl(196 90% 50% / 0.08), transparent 60%),
+    hsl(var(--background));
+}
+
+.glass {
+  background: hsl(var(--card) / 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid hsl(var(--border));
+}
+
+.prose-notes {
+  color: hsl(var(--foreground));
+}
+.prose-notes h1, .prose-notes h2, .prose-notes h3 {
+  color: hsl(var(--foreground));
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.prose-notes h1 { font-size: 1.5rem; margin-top: 1.25rem; margin-bottom: 0.75rem; }
+.prose-notes h2 { font-size: 1.2rem; margin-top: 1.1rem; margin-bottom: 0.5rem; }
+.prose-notes h3 { font-size: 1.05rem; margin-top: 0.9rem; margin-bottom: 0.4rem; }
+.prose-notes p  { margin: 0.5rem 0; line-height: 1.65; }
+.prose-notes ul { list-style: disc; padding-left: 1.25rem; margin: 0.5rem 0; }
+.prose-notes ol { list-style: decimal; padding-left: 1.25rem; margin: 0.5rem 0; }
+.prose-notes li { margin: 0.25rem 0; }
+.prose-notes code {
+  font-family: var(--app-font-mono);
+  background: hsl(var(--muted));
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.3rem;
+  font-size: 0.9em;
+}
+.prose-notes pre {
+  background: hsl(var(--muted));
+  border: 1px solid hsl(var(--border));
+  padding: 0.85rem 1rem;
+  border-radius: 0.6rem;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+}
+.prose-notes pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.875rem;
+}
+.prose-notes blockquote {
+  border-left: 3px solid hsl(var(--primary));
+  padding-left: 0.85rem;
+  color: hsl(var(--muted-foreground));
+  margin: 0.75rem 0;
+}
+.prose-notes a { color: hsl(var(--accent)); text-decoration: underline; }

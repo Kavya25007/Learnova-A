@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Smart Lecture Notes"
+version = "1.0.0"
+id = "artifacts/lecture-notes"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18148
+
+[services.development]
+run = "pnpm --filter @workspace/lecture-notes run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/lecture-notes", "run", "build" ]
+publicDir = "artifacts/lecture-notes/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18148"
+BASE_PATH = "/"
