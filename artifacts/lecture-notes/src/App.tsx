@@ -34,6 +34,8 @@ type Frame = {
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
 const INTERVALS = [3, 5, 10] as const;
+const MIN_INTERVAL = 2;
+const MAX_INTERVAL = 15;
 const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
 
 function classNames(...c: (string | false | null | undefined)[]) {
@@ -406,12 +408,21 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <label className="cursor-pointer group">
+              <label
+                className={classNames(
+                  "cursor-pointer group",
+                  youtubeUrl && "opacity-50 pointer-events-none",
+                )}
+              >
                 <input
                   type="file"
                   accept="video/*"
                   className="hidden"
-                  onChange={onPickFile}
+                  disabled={!!youtubeUrl}
+                  onChange={(e) => {
+                    setYoutubeUrl("");
+                    onPickFile(e);
+                  }}
                 />
                 <div className="rounded-lg border border-dashed border-border bg-card hover:border-primary hover:bg-secondary transition p-4 flex items-center gap-3">
                   <div className="w-10 h-10 rounded-md bg-primary/10 grid place-items-center text-primary">
@@ -426,11 +437,17 @@ export default function App() {
                 </div>
               </label>
 
-              <div className="rounded-lg border border-border bg-card p-3 flex items-center gap-2">
+              <div
+                className={classNames(
+                  "rounded-lg border border-border bg-card p-3 flex items-center gap-2",
+                  videoFile && "opacity-50 pointer-events-none",
+                )}
+              >
                 <Youtube className="w-5 h-5 text-destructive shrink-0" />
                 <input
                   type="url"
                   value={youtubeUrl}
+                  disabled={!!videoFile}
                   onChange={(e) => setYoutubeUrl(e.target.value)}
                   placeholder="Paste YouTube link (preview only)"
                   className="bg-transparent outline-none text-sm w-full placeholder:text-muted-foreground"
@@ -445,6 +462,9 @@ export default function App() {
                 )}
               </div>
             </div>
+            <p className="mt-2 text-[11px] text-muted-foreground">
+              Use one source at a time — uploading a file disables the link, and vice versa.
+            </p>
 
             {ytEmbed && !videoUrl && (
               <div className="mt-3 rounded-lg overflow-hidden border border-border aspect-video bg-black">
@@ -508,6 +528,30 @@ export default function App() {
                       {s}s {s === 5 && <span className="text-[10px] opacity-80">rec.</span>}
                     </button>
                   ))}
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <label className="text-[11px] text-muted-foreground shrink-0">
+                    Custom ({MIN_INTERVAL}–{MAX_INTERVAL}s):
+                  </label>
+                  <input
+                    type="number"
+                    min={MIN_INTERVAL}
+                    max={MAX_INTERVAL}
+                    step={1}
+                    value={interval}
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      if (Number.isFinite(n)) {
+                        setInterval(
+                          Math.max(MIN_INTERVAL, Math.min(MAX_INTERVAL, Math.round(n))),
+                        );
+                      }
+                    }}
+                    className="w-20 px-2 py-1 rounded-md bg-card border border-border text-sm outline-none focus:ring-2 focus:ring-ring"
+                  />
+                  <span className="text-[11px] text-muted-foreground">
+                    Recommended: 5 seconds
+                  </span>
                 </div>
               </div>
               <div>
@@ -746,7 +790,7 @@ export default function App() {
                 </div>
               )}
               {!generatingNotes && notes && (
-                <div className="prose-notes text-sm">
+                <div key={notes.length} className="prose-notes text-sm notes-fade-in">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
                 </div>
               )}
