@@ -568,6 +568,7 @@ export default function App() {
                 <button
                   onClick={startProcessing}
                   disabled={!videoUrl}
+                  title={!videoUrl ? "Upload a video file first" : "Capture frames and run OCR"}
                   className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium shadow hover:opacity-95 disabled:opacity-50 disabled:cursor-not-allowed transition"
                 >
                   <Play className="w-4 h-4" /> Start Processing
@@ -584,6 +585,11 @@ export default function App() {
               <button
                 onClick={generateNotes}
                 disabled={frames.length === 0 || generatingNotes || processing}
+                title={
+                  frames.length === 0
+                    ? "Run Start Processing first to capture frames"
+                    : "Generate structured notes from the captured frames"
+                }
                 className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-foreground text-background font-medium shadow hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition"
               >
                 {generatingNotes ? (
@@ -605,6 +611,21 @@ export default function App() {
                 </button>
               )}
             </div>
+
+            {!videoUrl && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Upload a video file above to enable
+                <span className="text-foreground font-medium"> Start Processing</span>.
+                YouTube links are preview-only.
+              </p>
+            )}
+            {videoUrl && frames.length === 0 && !processing && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Click <span className="text-foreground font-medium">Start Processing</span>{" "}
+                to capture frames. Then{" "}
+                <span className="text-foreground font-medium">Generate Notes</span> will activate.
+              </p>
+            )}
 
             {(processing || phase) && (
               <div className="mt-4">
