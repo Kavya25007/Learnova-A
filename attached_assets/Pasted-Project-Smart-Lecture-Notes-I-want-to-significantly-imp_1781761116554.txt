@@ -1,0 +1,146 @@
+Project: Smart Lecture Notes
+
+I want to significantly improve the performance, scalability, and user experience of this application.
+
+### 1. Direct YouTube Processing (Highest Priority)
+
+Currently users must download a YouTube video manually and then upload it. I want direct YouTube support.
+
+Requirements:
+
+* User pastes a YouTube URL.
+* Backend automatically fetches video metadata.
+* Extract frames from the video server-side.
+* No manual download step required.
+* Show video title, thumbnail, duration, and channel information before processing.
+* Handle long videos efficiently.
+* Display proper error messages for unavailable, private, age-restricted, or unsupported videos.
+
+### 2. Massive Performance Optimization
+
+Current processing is too slow for 1+ hour videos.
+
+Implement:
+
+* Scene-change detection instead of fixed interval capture.
+* Capture frames only when slides visibly change.
+* Run perceptual hash comparison before OCR.
+* Skip OCR completely for duplicate frames.
+* Use worker threads for OCR processing.
+* Process multiple frames in parallel.
+* Batch OCR operations.
+* Cache OCR results.
+* Reduce image size before OCR without affecting readability.
+* Lazy load OCR workers.
+
+Target:
+
+* Reduce processing time by at least 70–90%.
+
+### 3. Smart Slide Detection
+
+Add AI-assisted slide detection:
+
+* Detect title slides.
+* Detect code slides.
+* Detect diagrams.
+* Detect mathematical content.
+* Detect screenshots.
+* Group related slides together.
+
+### 4. Better Note Generation
+
+Current notes should become more intelligent.
+
+Add:
+
+* Automatic table generation.
+* Key concepts section.
+* Important formulas section.
+* Summary section.
+* Interview questions section.
+* Quiz generation.
+* Flashcards generation.
+* Revision notes.
+* Action items and tasks extraction.
+
+Output Modes:
+
+* Smart Notes
+* Detailed Notes
+* Exam Revision Notes
+* Flashcards
+* Quiz Mode
+
+### 5. Long Video Handling
+
+For videos longer than 60 minutes:
+
+* Split processing into chunks.
+* Process chunks in parallel.
+* Merge results automatically.
+* Show live progress:
+
+  * Frame extraction %
+  * OCR %
+  * AI generation %
+  * Remaining time estimate
+
+### 6. Better OCR
+
+Improve OCR quality:
+
+* Auto contrast enhancement.
+* Sharpen text before OCR.
+* Detect code blocks separately.
+* Preserve indentation.
+* Improve recognition of formulas and technical content.
+
+### 7. Export Features
+
+Add exports:
+
+* Markdown
+* PDF
+* DOCX
+* TXT
+* Anki Flashcards
+* Notion-compatible export
+
+### 8. AI Chat Upgrade
+
+Allow users to:
+
+* Ask questions about generated notes.
+* Generate summaries.
+* Explain concepts.
+* Create quizzes.
+* Generate interview questions.
+
+### 9. Modern UI
+
+Upgrade UI with:
+
+* Processing dashboard
+* Progress bars
+* Statistics
+* Frame count
+* OCR count
+* Processing speed
+* Dark mode
+* Mobile responsive layout
+
+### 10. Architecture Improvements
+
+Refactor project for production readiness:
+
+* Better folder structure
+* Reusable hooks
+* Type-safe API contracts
+* Error boundaries
+* Background jobs
+* Performance monitoring
+* Memory optimization
+
+Goal:
+Transform Smart Lecture Notes into a production-grade AI study platform capable of processing long educational videos quickly and generating high-quality notes, flashcards, quizzes, and study materials.

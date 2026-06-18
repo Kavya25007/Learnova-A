@@ -17,9 +17,18 @@ import {
   Youtube,
   X,
   HelpCircle,
+  Moon,
+  Sun,
+  Printer,
+  BookOpen,
+  GraduationCap,
+  ClipboardList,
+  HelpingHand,
 } from "lucide-react";
 
-type Mode = "exact" | "smart";
+type Mode = "smart" | "exact" | "detailed" | "exam" | "flashcards" | "quiz";
+
+type YtMeta = { title: string; channel: string; thumbnail: string };
 
 type Frame = {
   id: string;
@@ -150,8 +159,27 @@ export default function App() {
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const [darkMode, setDarkMode] = useState(() =>
+    document.documentElement.classList.contains("dark"),
+  );
+  const [ytMeta, setYtMeta] = useState<YtMeta | null>(null);
+  const [ytMetaLoading, setYtMetaLoading] = useState(false);
+  // Processing stats
+  const [statFrames, setStatFrames] = useState(0);
+  const [statOcr, setStatOcr] = useState(0);
+  const [statElapsed, setStatElapsed] = useState(0);
+  const processingStartRef = useRef<number>(0);
+  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (darkMode) {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  }, [darkMode]);
 
   useEffect(() => {
     if (!videoFile) {
@@ -178,12 +206,42 @@ export default function App() {
     return m ? `https://www.youtube.com/embed/${m[1]}` : "";
   }, [youtubeUrl]);
 
+  // Fetch YouTube metadata when URL changes
+  useEffect(() => {
+    if (!youtubeUrl) { setYtMeta(null); return; }
+    const m = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/);
+    if (!m) { setYtMeta(null); return; }
+    setYtMetaLoading(true);
+    setYtMeta(null);
+    fetch(`${apiBase}/youtube/meta?url=${encodeURIComponent(youtubeUrl)}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d) setYtMeta(d as YtMeta); })
+      .catch(() => {})
+      .finally(() => setYtMetaLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [youtubeUrl]);
+
   function reset() {
     cancelRef.current = false;
     setFrames([]);
     setNotes("");
     setProgress(0);
     setPhase("");
+    setStatFrames(0);
+    setStatOcr(0);
+    setStatElapsed(0);
+  }
+
+  // Enhance canvas contrast/brightness to improve OCR
+  function preprocessCanvas(src: HTMLCanvasElement): HTMLCanvasElement {
+    const out = document.createElement("canvas");
+    out.width = src.width;
+    out.height = src.height;
+    const ctx = out.getContext("2d")!;
+    ctx.filter = "contrast(1.4) brightness(1.05) saturate(0)";
+    ctx.drawImage(src, 0, 0);
+    ctx.filter = "none";
+    return out;
   }
 
   function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -210,6 +268,10 @@ export default function App() {
     reset();
     setProcessing(true);
     cancelRef.current = false;
+    processingStartRef.current = Date.now();
+    elapsedTimerRef.current = setInterval(() => {
+      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
+    }, 1000);
 
     const captured: Frame[] = [];
     const canvas = document.createElement("canvas");
@@ -285,7 +347,8 @@ export default function App() {
         continue;
       }
 
-      const thumb = canvas.toDataURL("image/jpeg", 0.78);
+      const processed = preprocessCanvas(canvas);
+      const thumb = processed.toDataURL("image/jpeg", 0.78);
       captured.push({
         id: `${i}-${t.toFixed(2)}`,
         timestamp: t,
@@ -296,10 +359,12 @@ export default function App() {
         ocrDone: false,
       });
       setFrames([...captured]);
+      setStatFrames(captured.length);
       setProgress(Math.round(((i + 1) / (steps + 1)) * 50));
     }
 
     if (cancelRef.current) {
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
       setProcessing(false);
       setPhase("Cancelled");
       return;
@@ -336,12 +401,17 @@ export default function App() {
         };
       }
       setFrames([...captured]);
+      setStatOcr(i + 1);
       setProgress(50 + Math.round(((i + 1) / captured.length) * 50));
     }
+
+    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+    setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
 
     // Drop frames with very little text (likely no slide content)
     const filtered = captured.filter((f) => f.text.replace(/\s+/g, "").length >= 8);
     setFrames(filtered);
+    setStatFrames(filtered.length);
     setProcessing(false);
     setPhase(
       filtered.length
@@ -392,7 +462,7 @@ export default function App() {
       const res = await fetch(`${apiBase}/assistant/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: next }),
+        body: JSON.stringify({ messages: next, notes: notes || undefined }),
       });
       const data = await res.json();
       setChat([
@@ -433,6 +503,13 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => setDarkMode((d) => !d)}
+              className="p-2 rounded-lg border border-border bg-card hover:bg-secondary transition"
+              title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
+            >
+              {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
             <button
               onClick={() => setChatOpen(true)}
               className="hidden sm:inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card hover:bg-secondary text-sm transition"
@@ -515,19 +592,41 @@ export default function App() {
               Use one source at a time — uploading a file disables the link, and vice versa.
             </p>
 
-            {ytEmbed && !videoUrl && (
-              <div className="mt-3 rounded-lg overflow-hidden border border-border aspect-video bg-black">
-                <iframe
-                  src={ytEmbed}
-                  className="w-full h-full"
-                  allow="accelerated-2d-canvas; encrypted-media; picture-in-picture"
-                  allowFullScreen
-                />
-                <p className="text-[11px] text-muted-foreground p-2 bg-card">
-                  YouTube embeds cannot be processed directly due to browser restrictions.
-                  Download the video and upload it as a file to extract notes.
-                </p>
-              </div>
+            {youtubeUrl && !videoUrl && (
+              <>
+                {ytMetaLoading && (
+                  <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Fetching video info...
+                  </div>
+                )}
+                {ytMeta && (
+                  <div className="mt-3 flex items-center gap-3 rounded-lg border border-border bg-card p-3">
+                    <img
+                      src={ytMeta.thumbnail}
+                      alt="thumbnail"
+                      className="w-20 h-12 rounded object-cover shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium truncate">{ytMeta.title}</p>
+                      <p className="text-xs text-muted-foreground">{ytMeta.channel}</p>
+                    </div>
+                  </div>
+                )}
+                {ytEmbed && (
+                  <div className="mt-3 rounded-lg overflow-hidden border border-border aspect-video bg-black">
+                    <iframe
+                      src={ytEmbed}
+                      className="w-full h-full"
+                      allow="accelerated-2d-canvas; encrypted-media; picture-in-picture"
+                      allowFullScreen
+                    />
+                    <p className="text-[11px] text-muted-foreground p-2 bg-card">
+                      YouTube embeds cannot be processed directly due to browser restrictions.
+                      Download the video and upload it as a file to extract notes.
+                    </p>
+                  </div>
+                )}
+              </>
             )}
 
             {videoUrl && (
@@ -603,55 +702,35 @@ export default function App() {
                   </span>
                 </div>
               </div>
-              <div>
+              <div className="sm:col-span-2">
                 <label className="text-xs text-muted-foreground">Notes mode</label>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <button
-                    onClick={() => setMode("smart")}
-                    className={classNames(
-                      "px-3 py-2 rounded-lg text-sm border transition text-left",
-                      mode === "smart"
-                        ? "bg-accent text-accent-foreground border-accent shadow"
-                        : "bg-card border-border hover:bg-secondary",
-                    )}
-                  >
-                    <div className="flex items-center gap-2 font-medium">
-                      <Sparkles className="w-4 h-4" /> Smart
-                    </div>
-                    <p
+                <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {(
+                    [
+                      { key: "smart",      icon: <Sparkles className="w-3.5 h-3.5" />,      label: "Smart",       desc: "Concise, deduped" },
+                      { key: "exact",      icon: <FileText className="w-3.5 h-3.5" />,       label: "Exact",       desc: "Full detail + code" },
+                      { key: "detailed",   icon: <BookOpen className="w-3.5 h-3.5" />,       label: "Detailed",    desc: "Summary + key concepts" },
+                      { key: "exam",       icon: <GraduationCap className="w-3.5 h-3.5" />,  label: "Exam Revision", desc: "Common questions + tips" },
+                      { key: "flashcards", icon: <ClipboardList className="w-3.5 h-3.5" />,  label: "Flashcards",  desc: "Q&A study cards" },
+                      { key: "quiz",       icon: <HelpingHand className="w-3.5 h-3.5" />,    label: "Quiz",        desc: "Multiple-choice test" },
+                    ] as { key: string; icon: React.ReactNode; label: string; desc: string }[]
+                  ).map(({ key, icon, label, desc }) => (
+                    <button
+                      key={key}
+                      onClick={() => setMode(key as typeof mode)}
                       className={classNames(
-                        "text-[11px] mt-0.5",
-                        mode === "smart"
-                          ? "text-accent-foreground/85"
-                          : "text-muted-foreground",
+                        "px-3 py-2 rounded-lg text-sm border transition text-left",
+                        mode === key
+                          ? "bg-primary text-primary-foreground border-primary shadow"
+                          : "bg-card border-border hover:bg-secondary",
                       )}
                     >
-                      Concise, deduped, easy to revise
-                    </p>
-                  </button>
-                  <button
-                    onClick={() => setMode("exact")}
-                    className={classNames(
-                      "px-3 py-2 rounded-lg text-sm border transition text-left",
-                      mode === "exact"
-                        ? "bg-primary text-primary-foreground border-primary shadow"
-                        : "bg-card border-border hover:bg-secondary",
-                    )}
-                  >
-                    <div className="flex items-center gap-2 font-medium">
-                      <FileText className="w-4 h-4" /> Exact
-                    </div>
-                    <p
-                      className={classNames(
-                        "text-[11px] mt-0.5",
-                        mode === "exact"
-                          ? "text-primary-foreground/85"
-                          : "text-muted-foreground",
-                      )}
-                    >
-                      Preserves all detail and code
-                    </p>
-                  </button>
+                      <div className="flex items-center gap-1.5 font-medium">{icon} {label}</div>
+                      <p className={classNames("text-[10px] mt-0.5", mode === key ? "text-primary-foreground/80" : "text-muted-foreground")}>
+                        {desc}
+                      </p>
+                    </button>
+                  ))}
                 </div>
               </div>
             </div>
@@ -810,6 +889,24 @@ export default function App() {
                   />
                 </div>
                 <p className="text-xs text-muted-foreground mt-2">{phase}</p>
+                {(processing || statFrames > 0) && (
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <div className="rounded-lg bg-secondary/60 border border-border px-3 py-2 text-center">
+                      <p className="text-lg font-semibold tabular-nums">{statFrames}</p>
+                      <p className="text-[10px] text-muted-foreground">Frames</p>
+                    </div>
+                    <div className="rounded-lg bg-secondary/60 border border-border px-3 py-2 text-center">
+                      <p className="text-lg font-semibold tabular-nums">{statOcr}</p>
+                      <p className="text-[10px] text-muted-foreground">OCR done</p>
+                    </div>
+                    <div className="rounded-lg bg-secondary/60 border border-border px-3 py-2 text-center">
+                      <p className="text-lg font-semibold tabular-nums">
+                        {statElapsed < 60 ? `${statElapsed}s` : `${Math.floor(statElapsed / 60)}m${statElapsed % 60}s`}
+                      </p>
+                      <p className="text-[10px] text-muted-foreground">Elapsed</p>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -870,7 +967,7 @@ export default function App() {
                 <FileText className="w-4 h-4 text-primary" /> Generated notes
               </h2>
               {notes && (
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1 flex-wrap">
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(notes);
@@ -879,11 +976,7 @@ export default function App() {
                     }}
                     className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border bg-card hover:bg-secondary transition"
                   >
-                    {copied ? (
-                      <Check className="w-3.5 h-3.5" />
-                    ) : (
-                      <Copy className="w-3.5 h-3.5" />
-                    )}
+                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     {copied ? "Copied" : "Copy"}
                   </button>
                   <button
@@ -895,7 +988,14 @@ export default function App() {
                     }
                     className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border bg-card hover:bg-secondary transition"
                   >
-                    <Download className="w-3.5 h-3.5" /> Download
+                    <Download className="w-3.5 h-3.5" /> .md
+                  </button>
+                  <button
+                    onClick={() => window.print()}
+                    className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border bg-card hover:bg-secondary transition"
+                    title="Print or save as PDF"
+                  >
+                    <Printer className="w-3.5 h-3.5" /> PDF
                   </button>
                 </div>
               )}
