@@ -1,0 +1,134 @@
+Upgrade Smart Lecture Notes into a production-ready AI study platform.
+
+IMPORTANT:
+Do not keep YouTube URLs as preview-only.
+
+### YouTube Processing
+
+Current behavior:
+
+* User pastes a YouTube URL.
+* App only shows preview.
+* Start Processing remains disabled.
+
+Required behavior:
+
+1. Accept:
+
+   * youtube.com URLs
+   * youtu.be URLs
+   * YouTube Shorts URLs
+
+2. After URL validation:
+
+   * Fetch title
+   * Fetch thumbnail
+   * Fetch duration
+   * Fetch channel name
+
+3. Enable Start Processing automatically.
+
+4. If browser CORS restrictions prevent frame extraction:
+
+   * Move video acquisition to backend.
+   * Download/process video server-side.
+   * Extract frames using FFmpeg.
+   * Continue existing OCR pipeline.
+
+5. Show errors for:
+
+   * Invalid URL
+   * Private video
+   * Age-restricted video
+   * Download failure
+
+### Performance Improvements
+
+Current processing is too slow for long videos.
+
+Implement:
+
+* Default interval = 10 seconds
+* Smart scene-change detection
+* OCR only on changed slides
+* Skip duplicate frames before OCR
+* Multi-worker OCR processing
+* Parallel frame extraction
+* Batch OCR requests
+* OCR caching
+* Downscale frames before OCR
+* Process videos in chunks
+
+Target:
+Reduce processing time by 70–90%.
+
+### Smart Processing
+
+Add:
+
+* Auto-detect slide lectures
+* Auto-detect coding tutorials
+* Auto-detect diagrams
+* Auto-detect math content
+
+Adjust OCR strategy accordingly.
+
+### Progress Dashboard
+
+Show:
+
+* Total frames detected
+* Unique frames detected
+* OCR progress %
+* Notes generation %
+* Estimated remaining time
+* Processing speed
+
+### New Output Modes
+
+Keep:
+
+* Smart
+* Exact
+
+Add:
+
+* Detailed
+* Exam Revision
+* Flashcards
+* Quiz
+
+### Export Options
+
+Add:
+
+* Markdown
+* PDF
+* DOCX
+* TXT
+* Anki Flashcards
+
+### AI Improvements
+
+Generated notes should include:
+
+* Key Concepts
+* Summary
+* Important Formulas
+* Interview Questions
+* Practice Questions
+* Revision Notes
+
+### Code Quality
+
+Refactor:
+
+* Type-safe API contracts
+* Reusable hooks
+* Error boundaries
+* Better state management
+* Better folder structure
+* Performance monitoring
+
+Goal:
+Transform Smart Lecture Notes into a fast, scalable, production-ready AI-powered lecture-to-notes platform.

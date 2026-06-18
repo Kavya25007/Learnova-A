@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Tesseract from "tesseract.js";
+import { Document, Paragraph, TextRun, HeadingLevel, Packer } from "docx";
 import {
   Upload,
   Play,
@@ -24,6 +25,7 @@ import {
   GraduationCap,
   ClipboardList,
   HelpingHand,
+  ChevronDown,
 } from "lucide-react";
 
 type Mode = "smart" | "exact" | "detailed" | "exam" | "flashcards" | "quiz";
@@ -45,6 +47,7 @@ type ChatMessage = { role: "user" | "assistant"; content: string };
 const INTERVALS = [3, 5, 10] as const;
 const MIN_INTERVAL = 2;
 const MAX_INTERVAL = 15;
+const NUM_OCR_WORKERS = 3;
 const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
 
 function classNames(...c: (string | false | null | undefined)[]) {
@@ -107,6 +110,61 @@ function downloadFile(name: string, content: string, type = "text/markdown") {
   URL.revokeObjectURL(url);
 }
 
+function downloadBlob(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function exportDocx(notes: string, slug: string) {
+  const lines = notes.split("\n");
+  const paragraphs = lines.map((line) => {
+    if (line.startsWith("# ")) return new Paragraph({ text: line.slice(2), heading: HeadingLevel.HEADING_1 });
+    if (line.startsWith("## ")) return new Paragraph({ text: line.slice(3), heading: HeadingLevel.HEADING_2 });
+    if (line.startsWith("### ")) return new Paragraph({ text: line.slice(4), heading: HeadingLevel.HEADING_3 });
+    // Strip markdown bold/italic for plain body text
+    const cleaned = line.replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1");
+    return new Paragraph({ children: [new TextRun(cleaned)] });
+  });
+  const doc = new Document({ sections: [{ children: paragraphs }] });
+  const blob = await Packer.toBlob(doc);
+  downloadBlob(`${slug}.docx`, blob);
+}
+
+function exportTxt(notes: string, slug: string) {
+  // Strip markdown symbols to produce plain text
+  const plain = notes
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/`{1,3}[^`]*`{1,3}/g, (m) => m.replace(/`/g, ""))
+    .replace(/^[-*]\s+/gm, "  - ")
+    .replace(/^>\s+/gm, "");
+  downloadFile(`${slug}.txt`, plain, "text/plain");
+}
+
+function exportAnki(notes: string, slug: string) {
+  // Parse Q/A flashcard blocks
+  const qMatches = [...notes.matchAll(/\*\*Q:\*\*\s*(.+)/g)];
+  const aMatches = [...notes.matchAll(/\*\*A:\*\*\s*([\s\S]+?)(?=\n---|\n\*\*Q:|\n##|$)/g)];
+  const rows: string[] = [];
+  for (let i = 0; i < Math.min(qMatches.length, aMatches.length); i++) {
+    const q = qMatches[i][1].trim();
+    const a = aMatches[i][1].trim().replace(/\n+/g, " ");
+    if (q && a) rows.push(`${q}\t${a}`);
+  }
+  if (rows.length === 0) {
+    alert("No flashcard pairs found. Generate notes in Flashcards mode first.");
+    return;
+  }
+  downloadFile(`${slug}-anki.tsv`, rows.join("\n"), "text/tab-separated-values");
+}
+
 function parseTime(s: string): number | null {
   if (!s) return null;
   const parts = s.trim().split(":").map((p) => p.trim());
@@ -131,7 +189,10 @@ export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string>("");
   const [youtubeUrl, setYoutubeUrl] = useState<string>("");
-  const [interval, setInterval] = useState<number>(5);
+  const [ytVideoError, setYtVideoError] = useState<string>("");
+  const [ytStreamLoading, setYtStreamLoading] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [interval, setIntervalVal] = useState<number>(10);
   const [mode, setMode] = useState<Mode>("smart");
   const [title, setTitle] = useState<string>("");
   const [rangeMode, setRangeMode] = useState<"full" | "custom">("full");
@@ -169,7 +230,7 @@ export default function App() {
   const [statOcr, setStatOcr] = useState(0);
   const [statElapsed, setStatElapsed] = useState(0);
   const processingStartRef = useRef<number>(0);
-  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const elapsedTimerRef = useRef<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -206,18 +267,33 @@ export default function App() {
     return m ? `https://www.youtube.com/embed/${m[1]}` : "";
   }, [youtubeUrl]);
 
-  // Fetch YouTube metadata when URL changes
+  // Fetch YouTube metadata and set up proxy stream when URL changes
   useEffect(() => {
-    if (!youtubeUrl) { setYtMeta(null); return; }
+    if (!youtubeUrl) {
+      setYtMeta(null);
+      setYtVideoError("");
+      setVideoUrl("");
+      return;
+    }
     const m = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/);
     if (!m) { setYtMeta(null); return; }
     setYtMetaLoading(true);
+    setYtStreamLoading(true);
+    setYtVideoError("");
     setYtMeta(null);
+    setVideoUrl("");
+
+    // Fetch metadata
     fetch(`${apiBase}/youtube/meta?url=${encodeURIComponent(youtubeUrl)}`)
       .then((r) => r.ok ? r.json() : null)
       .then((d) => { if (d) setYtMeta(d as YtMeta); })
       .catch(() => {})
       .finally(() => setYtMetaLoading(false));
+
+    // Set proxy stream URL — the video element will connect to it
+    const proxyUrl = `${apiBase}/youtube/stream?url=${encodeURIComponent(youtubeUrl)}`;
+    setVideoUrl(proxyUrl);
+    setYtStreamLoading(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [youtubeUrl]);
 
@@ -269,7 +345,7 @@ export default function App() {
     setProcessing(true);
     cancelRef.current = false;
     processingStartRef.current = Date.now();
-    elapsedTimerRef.current = setInterval(() => {
+    elapsedTimerRef.current = window.setInterval(() => {
       setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
     }, 1000);
 
@@ -364,48 +440,53 @@ export default function App() {
     }
 
     if (cancelRef.current) {
-      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
       setProcessing(false);
       setPhase("Cancelled");
       return;
     }
 
-    setPhase(`Running OCR on ${captured.length} unique frames`);
+    setPhase(`Running OCR on ${captured.length} unique frames (${NUM_OCR_WORKERS} workers in parallel)`);
 
-    // OCR sequentially to avoid overloading
-    for (let i = 0; i < captured.length; i++) {
-      if (cancelRef.current) break;
-      const f = captured[i];
-      try {
-        const result = await Tesseract.recognize(f.thumb, "eng", {
-          logger: (m) => {
-            if (m.status === "recognizing text") {
-              const localProg = m.progress || 0;
-              captured[i] = { ...captured[i], ocrProgress: localProg };
-              setFrames([...captured]);
+    // Create a pool of Tesseract workers for parallel OCR
+    const workers = await Promise.all(
+      Array.from({ length: Math.min(NUM_OCR_WORKERS, captured.length) }, () =>
+        Tesseract.createWorker("eng"),
+      ),
+    );
+
+    try {
+      // Process frames in batches equal to worker count
+      for (let i = 0; i < captured.length; i += workers.length) {
+        if (cancelRef.current) break;
+        const batch = captured.slice(i, i + workers.length);
+        await Promise.all(
+          batch.map(async (f, j) => {
+            const idx = i + j;
+            if (idx >= captured.length) return;
+            try {
+              const result = await workers[j].recognize(f.thumb);
+              captured[idx] = {
+                ...captured[idx],
+                text: (result.data.text || "").trim(),
+                ocrProgress: 1,
+                ocrDone: true,
+              };
+            } catch {
+              captured[idx] = { ...captured[idx], text: "", ocrProgress: 1, ocrDone: true };
             }
-          },
-        });
-        captured[i] = {
-          ...captured[i],
-          text: (result.data.text || "").trim(),
-          ocrProgress: 1,
-          ocrDone: true,
-        };
-      } catch (e) {
-        captured[i] = {
-          ...captured[i],
-          text: "",
-          ocrProgress: 1,
-          ocrDone: true,
-        };
+          }),
+        );
+        setFrames([...captured]);
+        const done = captured.filter((f) => f.ocrDone).length;
+        setStatOcr(done);
+        setProgress(50 + Math.round((done / captured.length) * 50));
       }
-      setFrames([...captured]);
-      setStatOcr(i + 1);
-      setProgress(50 + Math.round(((i + 1) / captured.length) * 50));
+    } finally {
+      await Promise.all(workers.map((w) => w.terminate()));
     }
 
-    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+    if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
     setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
 
     // Drop frames with very little text (likely no slide content)
@@ -612,19 +693,13 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {ytEmbed && (
-                  <div className="mt-3 rounded-lg overflow-hidden border border-border aspect-video bg-black">
-                    <iframe
-                      src={ytEmbed}
-                      className="w-full h-full"
-                      allow="accelerated-2d-canvas; encrypted-media; picture-in-picture"
-                      allowFullScreen
-                    />
-                    <p className="text-[11px] text-muted-foreground p-2 bg-card">
-                      YouTube embeds cannot be processed directly due to browser restrictions.
-                      Download the video and upload it as a file to extract notes.
-                    </p>
-                  </div>
+                {ytVideoError && (
+                  <p className="mt-2 text-xs text-destructive font-medium">{ytVideoError}</p>
+                )}
+                {ytStreamLoading && !ytVideoError && (
+                  <p className="mt-2 text-xs text-muted-foreground flex items-center gap-1.5">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Connecting to YouTube...
+                  </p>
                 )}
               </>
             )}
@@ -638,7 +713,20 @@ export default function App() {
                   className="w-full rounded-lg bg-black aspect-video"
                   crossOrigin="anonymous"
                   preload="metadata"
+                  onError={() => {
+                    if (youtubeUrl) {
+                      setYtVideoError(
+                        "Could not stream this YouTube video. It may be private, age-restricted, or unavailable.",
+                      );
+                      setVideoUrl("");
+                    }
+                  }}
                 />
+                {youtubeUrl && !ytVideoError && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Streaming via server proxy. Processing works the same as an uploaded file.
+                  </p>
+                )}
               </div>
             )}
 
@@ -665,7 +753,7 @@ export default function App() {
                   {INTERVALS.map((s) => (
                     <button
                       key={s}
-                      onClick={() => setInterval(s)}
+                      onClick={() => setIntervalVal(s)}
                       className={classNames(
                         "px-3 py-2 rounded-lg text-sm border transition flex-1",
                         interval === s
@@ -690,7 +778,7 @@ export default function App() {
                     onChange={(e) => {
                       const n = Number(e.target.value);
                       if (Number.isFinite(n)) {
-                        setInterval(
+                        setIntervalVal(
                           Math.max(MIN_INTERVAL, Math.min(MAX_INTERVAL, Math.round(n))),
                         );
                       }
@@ -979,24 +1067,37 @@ export default function App() {
                     {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     {copied ? "Copied" : "Copy"}
                   </button>
-                  <button
-                    onClick={() =>
-                      downloadFile(
-                        `${(title || "lecture-notes").replace(/\s+/g, "-")}.md`,
-                        notes,
-                      )
-                    }
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border bg-card hover:bg-secondary transition"
-                  >
-                    <Download className="w-3.5 h-3.5" /> .md
-                  </button>
-                  <button
-                    onClick={() => window.print()}
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border bg-card hover:bg-secondary transition"
-                    title="Print or save as PDF"
-                  >
-                    <Printer className="w-3.5 h-3.5" /> PDF
-                  </button>
+                  {/* Export dropdown */}
+                  <div className="relative">
+                    <button
+                      onClick={() => setExportOpen((v) => !v)}
+                      className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border bg-card hover:bg-secondary transition"
+                    >
+                      <Download className="w-3.5 h-3.5" /> Export <ChevronDown className="w-3 h-3" />
+                    </button>
+                    {exportOpen && (
+                      <div
+                        className="absolute right-0 mt-1 w-40 bg-card border border-border rounded-lg shadow-lg z-20 py-1"
+                        onMouseLeave={() => setExportOpen(false)}
+                      >
+                        {[
+                          { label: "Markdown (.md)", action: () => downloadFile(`${(title || "notes").replace(/\s+/g, "-")}.md`, notes) },
+                          { label: "Plain text (.txt)", action: () => exportTxt(notes, (title || "notes").replace(/\s+/g, "-")) },
+                          { label: "Word (.docx)", action: () => exportDocx(notes, (title || "notes").replace(/\s+/g, "-")) },
+                          { label: "PDF (print)", action: () => window.print() },
+                          { label: "Anki flashcards", action: () => exportAnki(notes, (title || "notes").replace(/\s+/g, "-")) },
+                        ].map(({ label, action }) => (
+                          <button
+                            key={label}
+                            onClick={() => { action(); setExportOpen(false); }}
+                            className="block w-full text-left px-3 py-1.5 text-xs hover:bg-secondary transition"
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
