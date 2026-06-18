@@ -1,6 +1,7 @@
 import { Router, type IRouter } from "express";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
+import { mkdir, rm, readdir, readFile } from "fs/promises";
 import { openai } from "@workspace/integrations-openai-ai-server";
 
 const execFileAsync = promisify(execFile);
@@ -150,94 +151,207 @@ router.post("/notes/generate", async (req, res) => {
 // ─── YouTube metadata ─────────────────────────────────────────────────────────
 
 router.get("/youtube/meta", async (req, res) => {
+  const url = req.query.url as string;
+  if (!url) { res.status(400).json({ error: "Missing url", step: "url_validation" }); return; }
+
+  const ytRx = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/;
+  const m = url.match(ytRx);
+  if (!m) { res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" }); return; }
+  const videoId = m[1];
+
   try {
-    const url = req.query.url as string;
-    if (!url) { res.status(400).json({ error: "Missing url" }); return; }
+    req.log.info({ videoId }, "Fetching YouTube metadata via oEmbed");
     const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
     const resp = await fetch(oembedUrl);
-    if (!resp.ok) { res.status(404).json({ error: "Video not found or unavailable" }); return; }
+    if (!resp.ok) {
+      req.log.warn({ videoId, status: resp.status }, "oEmbed returned non-OK status");
+      res.status(404).json({ error: "Video not found or unavailable", step: "metadata", videoId });
+      return;
+    }
     const data = (await resp.json()) as { title?: string; author_name?: string; thumbnail_url?: string };
-    res.json({ title: data.title ?? "", channel: data.author_name ?? "", thumbnail: data.thumbnail_url ?? "" });
+    req.log.info({ videoId, title: data.title }, "YouTube metadata fetched");
+    res.json({ title: data.title ?? "", channel: data.author_name ?? "", thumbnail: data.thumbnail_url ?? "", videoId });
   } catch (err) {
     req.log.error({ err }, "youtube meta failed");
-    res.status(500).json({ error: "Failed to fetch video metadata" });
+    res.status(500).json({ error: "Failed to fetch video metadata", step: "metadata" });
   }
 });
 
-// ─── YouTube video stream proxy ───────────────────────────────────────────────
-// Downloads via yt-dlp and pipes through ffmpeg → fragmented MP4 the browser
-// can play and from which canvas frame extraction works on all browsers.
+// ─── YouTube server-side frame extraction ────────────────────────────────────
+// Downloads video with yt-dlp, extracts frames with ffmpeg, returns base64.
+// The client feeds these frames directly into its Tesseract OCR pipeline —
+// no browser video element or streaming proxy needed.
 
-router.get("/youtube/stream", (req, res) => {
-  const url = req.query.url as string;
-  if (!url) { res.status(400).json({ error: "Missing url" }); return; }
-
-  const ytRx = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/;
-  if (!ytRx.test(url)) { res.status(400).json({ error: "Invalid YouTube URL" }); return; }
-
-  // yt-dlp downloads video+audio and writes to stdout
-  const ytdlp = spawn("yt-dlp", [
-    "-o", "-",
-    "--no-playlist",
-    "--no-check-certificate",
-    // prefer a single progressive stream; fall back to best merged
-    "--format",
-    "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
-    "--merge-output-format", "mp4",
-    url,
-  ]);
-
-  // ffmpeg remuxes to a fragmented MP4 that browsers can stream & seek
-  const ff = spawn("ffmpeg", [
-    "-loglevel", "error",
-    "-i", "pipe:0",
-    "-c", "copy",
-    "-f", "mp4",
-    "-movflags", "frag_keyframe+empty_moov+faststart",
-    "pipe:1",
-  ]);
-
-  res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Cache-Control", "no-store");
-
-  ytdlp.stdout.pipe(ff.stdin);
-  ff.stdout.pipe(res);
-
-  // Cleanup on client disconnect
-  const cleanup = () => {
-    try { ytdlp.kill("SIGKILL"); } catch { /* already gone */ }
-    try { ff.kill("SIGKILL"); } catch { /* already gone */ }
+router.post("/youtube/frames", async (req, res) => {
+  const { url, interval: rawInterval, startTime: rawStart, endTime: rawEnd } = req.body as {
+    url?: string;
+    interval?: number;
+    startTime?: number;
+    endTime?: number;
   };
-  req.on("close", cleanup);
 
-  ytdlp.stderr.on("data", (d: Buffer) => {
-    const msg = d.toString();
-    if (/ERROR|private|unavailable|age.?restrict/i.test(msg)) {
-      req.log.warn({ msg }, "yt-dlp stderr");
+  // Step 1: URL validation
+  if (!url) {
+    req.log.warn("youtube/frames: missing url");
+    res.status(400).json({ error: "Missing url", step: "url_validation" });
+    return;
+  }
+  const ytRx = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/;
+  const m = url.match(ytRx);
+  if (!m) {
+    req.log.warn({ url }, "youtube/frames: invalid URL");
+    res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" });
+    return;
+  }
+  const videoId = m[1];
+  const effectiveInterval = Math.max(1, Math.round(Number(rawInterval) || 10));
+  const startSec = Math.max(0, Number(rawStart) || 0);
+  const endSec = rawEnd != null ? Math.max(startSec + 1, Number(rawEnd)) : null;
+
+  req.log.info({ videoId, effectiveInterval, startSec, endSec }, "YouTube frame extraction requested");
+
+  const tmpDir = `/tmp/yt-${videoId}-${Date.now()}`;
+  const videoPath = `${tmpDir}/video.mp4`;
+  const framesDir = `${tmpDir}/frames`;
+
+  try {
+    await mkdir(framesDir, { recursive: true });
+
+    // Step 2: Download video
+    req.log.info({ videoId }, "Starting yt-dlp download");
+    try {
+      await execFileAsync("yt-dlp", [
+        "--no-playlist",
+        "--no-check-certificate",
+        "--format",
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best",
+        "--merge-output-format", "mp4",
+        "--output", videoPath,
+        url,
+      ], { timeout: 300_000 });
+      req.log.info({ videoId }, "yt-dlp download complete");
+    } catch (err: unknown) {
+      const raw = err as { stderr?: string; stdout?: string; message?: string };
+      const msg = String(raw.stderr || raw.message || err);
+      req.log.error({ videoId, msg: msg.slice(0, 500) }, "yt-dlp download failed");
+      if (/private video|video is private/i.test(msg)) {
+        res.status(403).json({ error: "This video is private", step: "download", videoId });
+      } else if (/age.?restrict|confirm your age|sign in/i.test(msg)) {
+        res.status(403).json({ error: "This video is age-restricted", step: "download", videoId });
+      } else if (/unavailable|not available|removed|banned/i.test(msg)) {
+        res.status(404).json({ error: "This video is unavailable or has been removed", step: "download", videoId });
+      } else if (/copyright/i.test(msg)) {
+        res.status(451).json({ error: "This video is blocked due to copyright", step: "download", videoId });
+      } else {
+        res.status(500).json({
+          error: `Download failed. yt-dlp output: ${msg.slice(0, 300)}`,
+          step: "download",
+          videoId,
+        });
+      }
+      return;
     }
-  });
 
-  ytdlp.on("error", (err) => {
-    req.log.error({ err }, "yt-dlp spawn error");
-    if (!res.headersSent) res.status(500).json({ error: "Failed to start downloader" });
-  });
-
-  ff.on("error", (err) => {
-    req.log.error({ err }, "ffmpeg spawn error");
-    if (!res.headersSent) res.status(500).json({ error: "Failed to process video" });
-  });
-
-  ytdlp.on("close", (code) => {
-    if (code !== 0 && code !== null) {
-      req.log.warn({ code }, "yt-dlp exited with non-zero code");
+    // Step 3: Get video duration via ffprobe
+    let duration = 0;
+    try {
+      const { stdout } = await execFileAsync("ffprobe", [
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        videoPath,
+      ], { timeout: 15_000 });
+      const probe = JSON.parse(stdout) as { format?: { duration?: string } };
+      duration = parseFloat(probe.format?.duration ?? "0") || 0;
+      req.log.info({ videoId, duration }, "ffprobe duration");
+    } catch (err) {
+      req.log.warn({ err }, "ffprobe failed; duration unknown");
     }
-    ff.stdin.end();
-  });
 
-  ff.on("close", () => {
-    res.end();
-  });
+    // Step 4: Extract frames
+    const actualEnd = endSec != null ? Math.min(endSec, duration || endSec) : duration;
+    const seekArg = startSec > 0 ? ["-ss", String(startSec)] : [];
+    const durationArg =
+      actualEnd > startSec ? ["-t", String(actualEnd - startSec)] : [];
+
+    const ffmpegArgs = [
+      "-loglevel", "warning",
+      ...seekArg,
+      "-i", videoPath,
+      ...durationArg,
+      "-vf", `fps=1/${effectiveInterval},scale='min(960\\,iw)':-2`,
+      "-qscale:v", "5",
+      "-f", "image2",
+      `${framesDir}/frame_%04d.jpg`,
+    ];
+
+    req.log.info({ videoId, ffmpegArgs: ffmpegArgs.join(" ") }, "Starting ffmpeg frame extraction");
+    try {
+      const { stderr } = await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 120_000 });
+      if (stderr) req.log.debug({ videoId, stderr: stderr.slice(0, 500) }, "ffmpeg stderr");
+      req.log.info({ videoId }, "ffmpeg frame extraction complete");
+    } catch (err: unknown) {
+      const raw = err as { stderr?: string; message?: string };
+      const msg = String(raw.stderr || raw.message || err);
+      req.log.error({ videoId, msg: msg.slice(0, 500) }, "ffmpeg frame extraction failed");
+      res.status(500).json({
+        error: `Frame extraction failed: ${msg.slice(0, 200)}`,
+        step: "frame_extraction",
+        videoId,
+      });
+      return;
+    }
+
+    // Step 5: Read frames and encode as base64
+    let frameFiles: string[] = [];
+    try {
+      frameFiles = (await readdir(framesDir))
+        .filter((f) => f.endsWith(".jpg"))
+        .sort();
+    } catch (err) {
+      req.log.error({ err }, "Failed to read frames directory");
+      res.status(500).json({ error: "Could not read extracted frames", step: "frame_read", videoId });
+      return;
+    }
+
+    if (frameFiles.length === 0) {
+      req.log.warn({ videoId }, "No frames extracted — video may have no visual content");
+      res.status(422).json({
+        error: "No frames could be extracted from this video. Try a shorter time range or different interval.",
+        step: "frame_extraction",
+        videoId,
+        duration,
+      });
+      return;
+    }
+
+    req.log.info({ videoId, frameCount: frameFiles.length }, "Encoding frames to base64");
+    const frames = await Promise.all(
+      frameFiles.map(async (file, i) => {
+        const data = await readFile(`${framesDir}/${file}`);
+        const timestamp = startSec + i * effectiveInterval;
+        return {
+          timestamp,
+          data: `data:image/jpeg;base64,${data.toString("base64")}`,
+        };
+      }),
+    );
+
+    req.log.info({ videoId, frameCount: frames.length }, "YouTube frames ready");
+    res.json({ frames, videoId, duration, frameCount: frames.length });
+  } catch (err) {
+    req.log.error({ err }, "Unexpected error in youtube/frames");
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Unexpected server error", step: "unknown", videoId });
+    }
+  } finally {
+    rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// ─── YouTube stream (legacy — kept for reference, no longer used by client) ──
+router.get("/youtube/stream", (_req, res) => {
+  res.status(410).json({ error: "YouTube streaming is no longer used. Use POST /api/youtube/frames instead." });
 });
 
 // ─── Assistant chat ───────────────────────────────────────────────────────────
@@ -245,10 +359,10 @@ router.get("/youtube/stream", (req, res) => {
 const ASSISTANT_SYSTEM = `You are an AI assistant inside a Smart Lecture Notes Generator web app.
 Help users navigate the app, answer questions about their generated notes, and explain study concepts.
 App workflow:
-1. Upload a video file OR paste a YouTube URL (which the app will stream directly).
-2. Select a capture interval (default 5s).
+1. Upload a video file OR paste a YouTube URL (the app downloads and processes it server-side).
+2. Select a capture interval (default 10s).
 3. Optionally set a Custom Time Range.
-4. Click Start Processing — the app captures frames, preprocesses for OCR, and deduplicates.
+4. Click Start Processing — the app downloads the video, extracts frames, runs OCR, and deduplicates.
 5. Choose a note mode: Smart, Exact, Detailed, Exam Revision, Flashcards, or Quiz.
 6. Click Generate Notes.
 If the user pastes their notes, you can answer questions about them, explain concepts, or generate quizzes.

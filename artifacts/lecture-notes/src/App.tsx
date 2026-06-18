@@ -225,6 +225,15 @@ export default function App() {
   );
   const [ytMeta, setYtMeta] = useState<YtMeta | null>(null);
   const [ytMetaLoading, setYtMetaLoading] = useState(false);
+  const [ytMetaError, setYtMetaError] = useState("");
+
+  type YtProcStatus = "idle" | "downloading" | "extracting" | "done" | "error";
+  const [ytDownloadStatus, setYtDownloadStatus] = useState<YtProcStatus>("idle");
+  const [ytExtractStatus, setYtExtractStatus] = useState<YtProcStatus>("idle");
+  const [ytErrorStep, setYtErrorStep] = useState("");
+  const [ytErrorMsg, setYtErrorMsg] = useState("");
+  const [ytDuration, setYtDuration] = useState(0);
+
   // Processing stats
   const [statFrames, setStatFrames] = useState(0);
   const [statOcr, setStatOcr] = useState(0);
@@ -267,35 +276,48 @@ export default function App() {
     return m ? `https://www.youtube.com/embed/${m[1]}` : "";
   }, [youtubeUrl]);
 
-  // Fetch YouTube metadata and set up proxy stream when URL changes
+  // Extract video ID from YouTube URL
+  const ytVideoId = useMemo(() => {
+    if (!youtubeUrl) return "";
+    const m = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/);
+    return m ? m[1] : "";
+  }, [youtubeUrl]);
+
+  // Fetch YouTube metadata when URL changes (metadata only — no streaming)
   useEffect(() => {
-    if (!youtubeUrl) {
+    if (!youtubeUrl || !ytVideoId) {
       setYtMeta(null);
+      setYtMetaError("");
       setYtVideoError("");
-      setVideoUrl("");
+      setYtDownloadStatus("idle");
+      setYtExtractStatus("idle");
+      setYtErrorStep("");
+      setYtErrorMsg("");
+      setYtDuration(0);
       return;
     }
-    const m = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/);
-    if (!m) { setYtMeta(null); return; }
     setYtMetaLoading(true);
-    setYtStreamLoading(true);
-    setYtVideoError("");
+    setYtMetaError("");
     setYtMeta(null);
-    setVideoUrl("");
+    setYtDownloadStatus("idle");
+    setYtExtractStatus("idle");
+    setYtErrorStep("");
+    setYtErrorMsg("");
 
-    // Fetch metadata
     fetch(`${apiBase}/youtube/meta?url=${encodeURIComponent(youtubeUrl)}`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => { if (d) setYtMeta(d as YtMeta); })
-      .catch(() => {})
+      .then(async (r) => {
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({})) as { error?: string };
+          setYtMetaError(err.error || `Metadata fetch failed (HTTP ${r.status})`);
+          return;
+        }
+        const d = await r.json() as YtMeta;
+        setYtMeta(d);
+      })
+      .catch((e: Error) => setYtMetaError(`Network error: ${e.message}`))
       .finally(() => setYtMetaLoading(false));
-
-    // Set proxy stream URL — the video element will connect to it
-    const proxyUrl = `${apiBase}/youtube/stream?url=${encodeURIComponent(youtubeUrl)}`;
-    setVideoUrl(proxyUrl);
-    setYtStreamLoading(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [youtubeUrl]);
+  }, [youtubeUrl, ytVideoId]);
 
   function reset() {
     cancelRef.current = false;
@@ -306,6 +328,11 @@ export default function App() {
     setStatFrames(0);
     setStatOcr(0);
     setStatElapsed(0);
+    setYtDownloadStatus("idle");
+    setYtExtractStatus("idle");
+    setYtErrorStep("");
+    setYtErrorMsg("");
+    setYtVideoError("");
   }
 
   // Enhance canvas contrast/brightness to improve OCR
@@ -329,7 +356,165 @@ export default function App() {
     }
   }
 
+  // ── YouTube server-side processing ──────────────────────────────────────────
+  // Downloads video + extracts frames on the server, skips the video element.
+  async function startYouTubeProcessing() {
+    reset();
+    setProcessing(true);
+    cancelRef.current = false;
+    processingStartRef.current = Date.now();
+    elapsedTimerRef.current = window.setInterval(() => {
+      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
+    }, 1000);
+
+    let startSec = 0;
+    let endSec: number | null = null;
+    if (rangeMode === "custom") {
+      const s = parseTime(startTime);
+      const e = parseTime(endTime);
+      if (s == null || e == null || e <= s) {
+        alert("Enter valid start and end times (mm:ss).");
+        setProcessing(false);
+        if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+        return;
+      }
+      startSec = s;
+      endSec = e;
+    }
+
+    try {
+      setYtDownloadStatus("downloading");
+      setPhase("Downloading YouTube video on server...");
+      setProgress(10);
+
+      const res = await fetch(`${apiBase}/youtube/frames`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: youtubeUrl,
+          interval,
+          startTime: startSec,
+          endTime: endSec ?? undefined,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as {
+          error?: string; step?: string; videoId?: string;
+        };
+        const msg = err.error || `Server error (HTTP ${res.status})`;
+        setYtDownloadStatus("error");
+        setYtExtractStatus("error");
+        setYtErrorStep(err.step || "unknown");
+        setYtErrorMsg(msg);
+        setYtVideoError(msg);
+        setPhase(`Failed: ${msg}`);
+        return;
+      }
+
+      setYtDownloadStatus("done");
+      setYtExtractStatus("extracting");
+      setPhase("Frames received. Running OCR...");
+      setProgress(30);
+
+      const data = await res.json() as {
+        frames: { timestamp: number; data: string }[];
+        videoId: string;
+        duration: number;
+        frameCount: number;
+      };
+
+      setYtExtractStatus("done");
+      setYtDuration(data.duration || 0);
+
+      if (!data.frames || data.frames.length === 0) {
+        setYtErrorMsg("No frames extracted from this video.");
+        setYtErrorStep("frame_extraction");
+        setPhase("No frames found.");
+        return;
+      }
+
+      // Build Frame objects from server-returned base64 images
+      const captured: Frame[] = data.frames.map((f) => ({
+        id: `yt-${f.timestamp}`,
+        timestamp: f.timestamp,
+        thumb: f.data,
+        hash: "",
+        text: "",
+        ocrProgress: 0,
+        ocrDone: false,
+      }));
+      setFrames([...captured]);
+      setStatFrames(captured.length);
+      setProgress(35);
+
+      setPhase(`Running OCR on ${captured.length} frames (${NUM_OCR_WORKERS} workers)`);
+
+      // Parallel OCR workers (same as file processing)
+      const workers = await Promise.all(
+        Array.from({ length: Math.min(NUM_OCR_WORKERS, captured.length) }, () =>
+          Tesseract.createWorker("eng"),
+        ),
+      );
+      try {
+        for (let i = 0; i < captured.length; i += workers.length) {
+          if (cancelRef.current) break;
+          await Promise.all(
+            captured.slice(i, i + workers.length).map(async (f, j) => {
+              const idx = i + j;
+              if (idx >= captured.length) return;
+              try {
+                const result = await workers[j].recognize(f.thumb);
+                captured[idx] = {
+                  ...captured[idx],
+                  text: (result.data.text || "").trim(),
+                  ocrProgress: 1,
+                  ocrDone: true,
+                };
+              } catch {
+                captured[idx] = { ...captured[idx], text: "", ocrProgress: 1, ocrDone: true };
+              }
+            }),
+          );
+          setFrames([...captured]);
+          const done = captured.filter((f) => f.ocrDone).length;
+          setStatOcr(done);
+          setProgress(35 + Math.round((done / captured.length) * 65));
+        }
+      } finally {
+        await Promise.all(workers.map((w) => w.terminate()));
+      }
+
+      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
+
+      const filtered = captured.filter((f) => f.text.replace(/\s+/g, "").length >= 8);
+      setFrames(filtered);
+      setStatFrames(filtered.length);
+      setPhase(
+        filtered.length
+          ? `Done. ${filtered.length} frame(s) with text.`
+          : "Done. No readable text found.",
+      );
+    } catch (e) {
+      const msg = `Network error: ${(e as Error).message}`;
+      setYtDownloadStatus("error");
+      setYtErrorStep("network");
+      setYtErrorMsg(msg);
+      setYtVideoError(msg);
+      setPhase("Network error.");
+    } finally {
+      setProcessing(false);
+      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+    }
+  }
+
   async function startProcessing() {
+    // Route to server-side processing for YouTube URLs
+    if (youtubeUrl && ytVideoId) {
+      await startYouTubeProcessing();
+      return;
+    }
     if (!videoRef.current || !videoUrl) return;
     const video = videoRef.current;
     if (!video.duration || isNaN(video.duration)) {
@@ -656,7 +841,7 @@ export default function App() {
                   value={youtubeUrl}
                   disabled={!!videoFile}
                   onChange={(e) => setYoutubeUrl(e.target.value)}
-                  placeholder="Paste YouTube link (preview only)"
+                  placeholder="Paste YouTube link"
                   className="bg-transparent outline-none text-sm w-full placeholder:text-muted-foreground"
                 />
                 {youtubeUrl && (
@@ -673,15 +858,16 @@ export default function App() {
               Use one source at a time — uploading a file disables the link, and vice versa.
             </p>
 
-            {youtubeUrl && !videoUrl && (
-              <>
+            {youtubeUrl && (
+              <div className="mt-3 space-y-2">
+                {/* Metadata card */}
                 {ytMetaLoading && (
-                  <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" /> Fetching video info...
                   </div>
                 )}
                 {ytMeta && (
-                  <div className="mt-3 flex items-center gap-3 rounded-lg border border-border bg-card p-3">
+                  <div className="flex items-center gap-3 rounded-lg border border-border bg-card p-3">
                     <img
                       src={ytMeta.thumbnail}
                       alt="thumbnail"
@@ -693,18 +879,79 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {ytVideoError && (
-                  <p className="mt-2 text-xs text-destructive font-medium">{ytVideoError}</p>
+                {ytMetaError && (
+                  <p className="text-xs text-destructive font-medium">{ytMetaError}</p>
                 )}
-                {ytStreamLoading && !ytVideoError && (
-                  <p className="mt-2 text-xs text-muted-foreground flex items-center gap-1.5">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Connecting to YouTube...
+
+                {/* Debug / status panel */}
+                {ytVideoId && (
+                  <div className="rounded-lg border border-border bg-card/60 p-3 text-[11px] space-y-1.5 font-mono">
+                    <p className="font-sans text-[11px] text-muted-foreground font-semibold tracking-wide uppercase mb-2">
+                      Processing status
+                    </p>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Video ID</span>
+                      <span className="text-foreground">{ytVideoId}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Metadata</span>
+                      <span className={ytMetaError ? "text-destructive" : ytMeta ? "text-green-500" : "text-muted-foreground"}>
+                        {ytMetaError ? "Error" : ytMeta ? "Loaded" : ytMetaLoading ? "Loading..." : "Pending"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Download</span>
+                      <span className={
+                        ytDownloadStatus === "error" ? "text-destructive" :
+                        ytDownloadStatus === "done" ? "text-green-500" :
+                        ytDownloadStatus === "downloading" ? "text-yellow-500" :
+                        "text-muted-foreground"
+                      }>
+                        {ytDownloadStatus === "idle" ? "Waiting" :
+                         ytDownloadStatus === "downloading" ? "In progress..." :
+                         ytDownloadStatus === "done" ? "Complete" : "Error"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Frame extraction</span>
+                      <span className={
+                        ytExtractStatus === "error" ? "text-destructive" :
+                        ytExtractStatus === "done" ? "text-green-500" :
+                        ytExtractStatus === "extracting" ? "text-yellow-500" :
+                        "text-muted-foreground"
+                      }>
+                        {ytExtractStatus === "idle" ? "Waiting" :
+                         ytExtractStatus === "extracting" ? "In progress..." :
+                         ytExtractStatus === "done" ? `Done (${statFrames} frames)` : "Error"}
+                      </span>
+                    </div>
+                    {ytDuration > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Duration</span>
+                        <span>{formatTime(ytDuration)}</span>
+                      </div>
+                    )}
+                    {ytErrorMsg && (
+                      <div className="mt-1 pt-1 border-t border-border">
+                        <p className="text-destructive break-words">
+                          <span className="font-semibold">Error ({ytErrorStep}):</span> {ytErrorMsg}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Ready message */}
+                {ytMeta && !ytMetaError && ytDownloadStatus === "idle" && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Video ready. Click Start Processing — the server will download and extract frames automatically.
                   </p>
                 )}
-              </>
+              </div>
             )}
 
-            {videoUrl && (
+            {/* File video preview — only for uploaded files, not YouTube */}
+            {videoUrl && !youtubeUrl && (
               <div className="mt-4">
                 <video
                   ref={videoRef}
@@ -713,21 +960,12 @@ export default function App() {
                   className="w-full rounded-lg bg-black aspect-video"
                   crossOrigin="anonymous"
                   preload="metadata"
-                  onError={() => {
-                    if (youtubeUrl) {
-                      setYtVideoError(
-                        "Could not stream this YouTube video. It may be private, age-restricted, or unavailable.",
-                      );
-                      setVideoUrl("");
-                    }
-                  }}
                 />
-                {youtubeUrl && !ytVideoError && (
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    Streaming via server proxy. Processing works the same as an uploaded file.
-                  </p>
-                )}
               </div>
+            )}
+            {/* Hidden video element for file processing (no controls) */}
+            {videoUrl && youtubeUrl && (
+              <video ref={videoRef} src="" className="hidden" />
             )}
 
             <div className="mt-4">
@@ -908,8 +1146,12 @@ export default function App() {
               {!processing ? (
                 <button
                   onClick={startProcessing}
-                  disabled={!videoUrl}
-                  title={!videoUrl ? "Upload a video file first" : "Capture frames and run OCR"}
+                  disabled={!videoUrl && !(youtubeUrl && ytVideoId && ytMeta && !ytMetaLoading)}
+                  title={
+                    videoUrl ? "Capture frames and run OCR" :
+                    youtubeUrl && ytMeta ? "Download and extract frames server-side" :
+                    "Upload a video file or paste a valid YouTube URL"
+                  }
                   className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium shadow hover:opacity-95 disabled:opacity-50 disabled:cursor-not-allowed transition"
                 >
                   <Play className="w-4 h-4" /> Start Processing
