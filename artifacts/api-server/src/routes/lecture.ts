@@ -240,7 +240,11 @@ router.post("/youtube/start", async (req: Request, res: Response) => {
   if (!m) { res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" }); return; }
   const videoId = m[1];
 
-  const effectiveInterval = Math.max(1, Math.round(Number(rawInterval) || 10));
+  // interval=0 means Auto — the job will compute it from ffprobe duration after download
+  const requestedInterval = Number(rawInterval ?? -1);
+  const autoInterval = requestedInterval === 0 || requestedInterval < 0;
+  // Use -1 as the sentinel value through to the job runner
+  const resolvedInterval = autoInterval ? 0 : Math.max(1, Math.round(requestedInterval));
   const startSec = Math.max(0, Number(rawStart) || 0);
   const endSec: number | null = rawEnd != null && rawEnd !== undefined ? Math.max(startSec + 1, Number(rawEnd)) : null;
 
@@ -255,11 +259,11 @@ router.post("/youtube/start", async (req: Request, res: Response) => {
   };
   jobs.set(jobId, job);
 
-  req.log.info({ jobId, videoId, effectiveInterval, startSec, endSec }, "YouTube job created");
+  req.log.info({ jobId, videoId, resolvedInterval, autoInterval, startSec, endSec }, "YouTube job created");
   res.json({ jobId, videoId });
 
   // Run processing asynchronously — completely detached from the HTTP response
-  runYouTubeJob(jobId, job, { url, videoId, effectiveInterval, startSec, endSec }, req.log).catch(
+  runYouTubeJob(jobId, job, { url, videoId, requestedInterval: resolvedInterval, autoInterval, startSec, endSec }, req.log).catch(
     (err) => req.log.error({ err, jobId }, "Unhandled error in YouTube job"),
   );
 });
@@ -293,14 +297,30 @@ router.get("/youtube/events/:jobId", (req: Request, res: Response) => {
   });
 });
 
+// ─── Adaptive interval (mirrors frontend logic) ───────────────────────────────
+function getAdaptiveInterval(durationSec: number): number {
+  if (durationSec <= 1800) return 5;   // ≤30 min  → 5 s
+  if (durationSec <= 5400) return 10;  // 30–90 min → 10 s
+  return 15;                           // ≥90 min   → 15 s
+}
+
+const MAX_FRAMES = 200;
+function clampToMaxFrames(intervalSec: number, spanSec: number): number {
+  const naiveCount = Math.ceil(spanSec / intervalSec);
+  if (naiveCount <= MAX_FRAMES) return intervalSec;
+  return Math.ceil(spanSec / MAX_FRAMES);
+}
+
 // ─── Background job runner ────────────────────────────────────────────────────
 async function runYouTubeJob(
   jobId: string,
   job: YtJob,
-  opts: { url: string; videoId: string; effectiveInterval: number; startSec: number; endSec: number | null },
+  opts: { url: string; videoId: string; requestedInterval: number; autoInterval: boolean; startSec: number; endSec: number | null },
   log: Request["log"],
 ) {
-  const { url, videoId, effectiveInterval, startSec, endSec } = opts;
+  const { url, videoId, requestedInterval, autoInterval, startSec, endSec } = opts;
+  // effectiveInterval is resolved after ffprobe when autoInterval=true
+  let effectiveInterval = requestedInterval > 0 ? requestedInterval : 10; // fallback
   const videoPath = `${job.tmpDir}/video.mp4`;
   const framesDir = `${job.tmpDir}/frames`;
 
@@ -361,7 +381,7 @@ async function runYouTubeJob(
       throw new Error("__handled__");
     });
 
-    // ── Phase 2: Get duration via ffprobe ────────────────────────────────────
+    // ── Phase 2: Get duration via ffprobe — also resolves adaptive interval ──
     let duration = 0;
     try {
       const { stdout } = await execFileAsync("ffprobe", [
@@ -369,6 +389,18 @@ async function runYouTubeJob(
       ], { timeout: 15_000 });
       const probe = JSON.parse(stdout) as { format?: { duration?: string } };
       duration = parseFloat(probe.format?.duration ?? "0") || 0;
+
+      // Resolve adaptive interval now that we know the duration
+      if (autoInterval && duration > 0) {
+        const span = endSec != null ? Math.min(endSec, duration) - startSec : duration - startSec;
+        const base = getAdaptiveInterval(duration);
+        effectiveInterval = clampToMaxFrames(base, span);
+        log.info({ jobId, duration, effectiveInterval, autoInterval }, "Adaptive interval resolved");
+        pushEvent(job, "status", {
+          step: "extracting",
+          message: `Using ${effectiveInterval}s interval (auto, ${Math.round(duration / 60)} min video)`,
+        });
+      }
     } catch { /* non-fatal */ }
 
     // ── Phase 3: Extract frames ───────────────────────────────────────────────

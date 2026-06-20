@@ -44,10 +44,27 @@ type Frame = {
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
-const INTERVALS = [3, 5, 10] as const;
+// 0 = Auto (adaptive). Named presets for the button row.
+const PRESET_INTERVALS = [3, 5, 10] as const;
+const AUTO_INTERVAL = 0;
 const MIN_INTERVAL = 2;
-const MAX_INTERVAL = 15;
+const MAX_INTERVAL = 60;
+const MAX_FRAMES = 200; // hard cap to keep OCR pipeline manageable
 const NUM_OCR_WORKERS = 3;
+
+// Adaptive interval: longer videos → larger interval to stay under MAX_FRAMES
+function getAdaptiveInterval(durationSec: number): number {
+  if (durationSec <= 1800) return 5;   // ≤30 min  → 5 s
+  if (durationSec <= 5400) return 10;  // 30–90 min → 10 s
+  return 15;                           // ≥90 min   → 15 s
+}
+
+// Enforce the MAX_FRAMES cap: if the naive frame count would exceed it, increase interval
+function clampToMaxFrames(intervalSec: number, spanSec: number): number {
+  const naiveCount = Math.ceil(spanSec / intervalSec);
+  if (naiveCount <= MAX_FRAMES) return intervalSec;
+  return Math.ceil(spanSec / MAX_FRAMES);
+}
 const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
 
 function classNames(...c: (string | false | null | undefined)[]) {
@@ -194,7 +211,8 @@ export default function App() {
   const [ytTotalFrames, setYtTotalFrames] = useState<number>(0);
   const sseRef = useRef<EventSource | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
-  const [interval, setIntervalVal] = useState<number>(10);
+  const [interval, setIntervalVal] = useState<number>(AUTO_INTERVAL);
+  const [videoKnownDuration, setVideoKnownDuration] = useState<number>(0);
   const [mode, setMode] = useState<Mode>("smart");
   const [title, setTitle] = useState<string>("");
   const [rangeMode, setRangeMode] = useState<"full" | "custom">("full");
@@ -405,7 +423,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: youtubeUrl,
-          interval,
+          interval: interval === AUTO_INTERVAL ? AUTO_INTERVAL : interval,
           startTime: startSec,
           endTime: endSec ?? undefined,
         }),
@@ -634,6 +652,9 @@ export default function App() {
 
     const duration = video.duration;
 
+    // Resolve the effective interval — Auto mode picks based on duration
+    const baseInterval = interval === AUTO_INTERVAL ? getAdaptiveInterval(duration) : interval;
+
     let startSec = 0;
     let endSec = duration;
     if (rangeMode === "custom") {
@@ -650,15 +671,18 @@ export default function App() {
         return;
       }
       startSec = Math.max(0, Math.min(s, duration - 0.1));
-      endSec = Math.max(startSec + interval, Math.min(e, duration));
+      endSec = Math.max(startSec + baseInterval, Math.min(e, duration));
     }
 
     const span = Math.max(0, endSec - startSec);
-    const steps = Math.max(1, Math.floor(span / interval));
+    // Apply the max-frames cap: increase interval if needed to stay under MAX_FRAMES
+    const effectiveInterval = clampToMaxFrames(baseInterval, span);
+    const steps = Math.max(1, Math.floor(span / effectiveInterval));
+    const autoNote = interval === AUTO_INTERVAL ? ` (auto: ${effectiveInterval}s for ${Math.round(duration / 60)}min video)` : "";
     setPhase(
       rangeMode === "custom"
-        ? `Capturing frames every ${interval}s from ${formatTime(startSec)} to ${formatTime(endSec)}`
-        : `Capturing frames every ${interval}s`,
+        ? `Capturing frames every ${effectiveInterval}s from ${formatTime(startSec)} to ${formatTime(endSec)}${autoNote}`
+        : `Capturing frames every ${effectiveInterval}s${autoNote}`,
     );
 
     video.pause();
@@ -681,7 +705,7 @@ export default function App() {
 
     for (let i = 0; i <= steps; i++) {
       if (cancelRef.current) break;
-      const t = Math.min(startSec + i * interval, endSec - 0.05, duration - 0.05);
+      const t = Math.min(startSec + i * effectiveInterval, endSec - 0.05, duration - 0.05);
       if (t < startSec) continue;
       await seekTo(t);
       // give the browser a tick to paint
@@ -1064,6 +1088,10 @@ export default function App() {
                   className="w-full rounded-lg bg-black aspect-video"
                   crossOrigin="anonymous"
                   preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const d = (e.currentTarget as HTMLVideoElement).duration;
+                    if (d && isFinite(d)) setVideoKnownDuration(d);
+                  }}
                 />
               </div>
             )}
@@ -1091,8 +1119,21 @@ export default function App() {
                 <label className="text-xs text-muted-foreground">
                   Capture interval
                 </label>
-                <div className="mt-2 flex gap-2">
-                  {INTERVALS.map((s) => (
+                <div className="mt-2 flex gap-1.5">
+                  {/* Auto (adaptive) button */}
+                  <button
+                    onClick={() => setIntervalVal(AUTO_INTERVAL)}
+                    className={classNames(
+                      "px-3 py-2 rounded-lg text-sm border transition flex-1",
+                      interval === AUTO_INTERVAL
+                        ? "bg-primary text-primary-foreground border-primary shadow"
+                        : "bg-card border-border hover:bg-secondary",
+                    )}
+                  >
+                    Auto
+                  </button>
+                  {/* Preset buttons */}
+                  {PRESET_INTERVALS.map((s) => (
                     <button
                       key={s}
                       onClick={() => setIntervalVal(s)}
@@ -1103,34 +1144,59 @@ export default function App() {
                           : "bg-card border-border hover:bg-secondary",
                       )}
                     >
-                      {s}s {s === 5 && <span className="text-[10px] opacity-80">rec.</span>}
+                      {s}s
                     </button>
                   ))}
                 </div>
-                <div className="mt-2 flex items-center gap-2">
-                  <label className="text-[11px] text-muted-foreground shrink-0">
-                    Custom ({MIN_INTERVAL}–{MAX_INTERVAL}s):
-                  </label>
-                  <input
-                    type="number"
-                    min={MIN_INTERVAL}
-                    max={MAX_INTERVAL}
-                    step={1}
-                    value={interval}
-                    onChange={(e) => {
-                      const n = Number(e.target.value);
-                      if (Number.isFinite(n)) {
-                        setIntervalVal(
-                          Math.max(MIN_INTERVAL, Math.min(MAX_INTERVAL, Math.round(n))),
-                        );
-                      }
-                    }}
-                    className="w-20 px-2 py-1 rounded-md bg-card border border-border text-sm outline-none focus:ring-2 focus:ring-ring"
-                  />
-                  <span className="text-[11px] text-muted-foreground">
-                    Recommended: 5 seconds
-                  </span>
-                </div>
+
+                {/* Auto mode: explain adaptive logic */}
+                {interval === AUTO_INTERVAL && (
+                  <div className="mt-2 rounded-md bg-card border border-border px-3 py-2 text-[11px] text-muted-foreground space-y-0.5">
+                    <p className="font-medium text-foreground">Adaptive interval (recommended)</p>
+                    <p>≤ 30 min video → 5 s &nbsp;|&nbsp; 30–90 min → 10 s &nbsp;|&nbsp; &gt; 90 min → 15 s</p>
+                    {videoKnownDuration > 0 && (
+                      <p className="text-foreground font-medium">
+                        This video ({formatTime(videoKnownDuration)}): using{" "}
+                        {clampToMaxFrames(getAdaptiveInterval(videoKnownDuration), videoKnownDuration)}s interval
+                        {" "}→ ~{Math.min(MAX_FRAMES, Math.ceil(videoKnownDuration / clampToMaxFrames(getAdaptiveInterval(videoKnownDuration), videoKnownDuration)))} frames
+                      </p>
+                    )}
+                    {ytMeta && ytDuration > 0 && (
+                      <p className="text-foreground font-medium">
+                        YouTube video ({formatTime(ytDuration)}): server will use{" "}
+                        {getAdaptiveInterval(ytDuration)}s interval
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Manual mode: show custom number input */}
+                {interval !== AUTO_INTERVAL && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <label className="text-[11px] text-muted-foreground shrink-0">
+                      Custom ({MIN_INTERVAL}–{MAX_INTERVAL}s):
+                    </label>
+                    <input
+                      type="number"
+                      min={MIN_INTERVAL}
+                      max={MAX_INTERVAL}
+                      step={1}
+                      value={interval}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        if (Number.isFinite(n)) {
+                          setIntervalVal(
+                            Math.max(MIN_INTERVAL, Math.min(MAX_INTERVAL, Math.round(n))),
+                          );
+                        }
+                      }}
+                      className="w-20 px-2 py-1 rounded-md bg-card border border-border text-sm outline-none focus:ring-2 focus:ring-ring"
+                    />
+                    <span className="text-[11px] text-muted-foreground">
+                      seconds between frames
+                    </span>
+                  </div>
+                )}
               </div>
               <div className="sm:col-span-2">
                 <label className="text-xs text-muted-foreground">Notes mode</label>
