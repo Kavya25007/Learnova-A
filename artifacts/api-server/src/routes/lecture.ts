@@ -299,16 +299,9 @@ router.get("/youtube/events/:jobId", (req: Request, res: Response) => {
 
 // ─── Adaptive interval (mirrors frontend logic) ───────────────────────────────
 function getAdaptiveInterval(durationSec: number): number {
-  if (durationSec <= 1800) return 5;   // ≤30 min  → 5 s
-  if (durationSec <= 5400) return 10;  // 30–90 min → 10 s
-  return 15;                           // ≥90 min   → 15 s
-}
-
-const MAX_FRAMES = 200;
-function clampToMaxFrames(intervalSec: number, spanSec: number): number {
-  const naiveCount = Math.ceil(spanSec / intervalSec);
-  if (naiveCount <= MAX_FRAMES) return intervalSec;
-  return Math.ceil(spanSec / MAX_FRAMES);
+  if (durationSec <= 1800) return 10;  // 0–30 min  → 10 s
+  if (durationSec <= 3600) return 15;  // 30–60 min → 15 s
+  return 20;                           // 60+ min   → 20 s
 }
 
 // ─── Background job runner ────────────────────────────────────────────────────
@@ -392,9 +385,7 @@ async function runYouTubeJob(
 
       // Resolve adaptive interval now that we know the duration
       if (autoInterval && duration > 0) {
-        const span = endSec != null ? Math.min(endSec, duration) - startSec : duration - startSec;
-        const base = getAdaptiveInterval(duration);
-        effectiveInterval = clampToMaxFrames(base, span);
+        effectiveInterval = getAdaptiveInterval(duration);
         log.info({ jobId, duration, effectiveInterval, autoInterval }, "Adaptive interval resolved");
         pushEvent(job, "status", {
           step: "extracting",

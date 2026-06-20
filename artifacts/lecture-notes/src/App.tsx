@@ -44,26 +44,15 @@ type Frame = {
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
-// 0 = Auto (adaptive). Named presets for the button row.
-const PRESET_INTERVALS = [3, 5, 10] as const;
+// 0 = Auto (adaptive). Positive number = Custom seconds.
 const AUTO_INTERVAL = 0;
-const MIN_INTERVAL = 2;
-const MAX_INTERVAL = 60;
-const MAX_FRAMES = 200; // hard cap to keep OCR pipeline manageable
 const NUM_OCR_WORKERS = 3;
 
-// Adaptive interval: longer videos → larger interval to stay under MAX_FRAMES
+// Adaptive interval tiers
 function getAdaptiveInterval(durationSec: number): number {
-  if (durationSec <= 1800) return 5;   // ≤30 min  → 5 s
-  if (durationSec <= 5400) return 10;  // 30–90 min → 10 s
-  return 15;                           // ≥90 min   → 15 s
-}
-
-// Enforce the MAX_FRAMES cap: if the naive frame count would exceed it, increase interval
-function clampToMaxFrames(intervalSec: number, spanSec: number): number {
-  const naiveCount = Math.ceil(spanSec / intervalSec);
-  if (naiveCount <= MAX_FRAMES) return intervalSec;
-  return Math.ceil(spanSec / MAX_FRAMES);
+  if (durationSec <= 1800) return 10;  // 0–30 min  → 10 s
+  if (durationSec <= 3600) return 15;  // 30–60 min → 15 s
+  return 20;                           // 60+ min   → 20 s
 }
 const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
 
@@ -224,6 +213,8 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [phase, setPhase] = useState<string>("");
   const cancelRef = useRef(false);
+  // Track raw text in the custom interval input so the field is freely editable
+  const [customInputStr, setCustomInputStr] = useState<string>("10");
 
   const [notes, setNotes] = useState<string>("");
   const [generatingNotes, setGeneratingNotes] = useState(false);
@@ -653,7 +644,14 @@ export default function App() {
     const duration = video.duration;
 
     // Resolve the effective interval — Auto mode picks based on duration
-    const baseInterval = interval === AUTO_INTERVAL ? getAdaptiveInterval(duration) : interval;
+    const effectiveInterval = interval === AUTO_INTERVAL ? getAdaptiveInterval(duration) : interval;
+
+    // Validate custom interval
+    if (interval !== AUTO_INTERVAL && (interval < 1 || !Number.isFinite(interval))) {
+      alert("Please enter a valid interval (at least 1 second).");
+      setProcessing(false);
+      return;
+    }
 
     let startSec = 0;
     let endSec = duration;
@@ -671,12 +669,10 @@ export default function App() {
         return;
       }
       startSec = Math.max(0, Math.min(s, duration - 0.1));
-      endSec = Math.max(startSec + baseInterval, Math.min(e, duration));
+      endSec = Math.max(startSec + effectiveInterval, Math.min(e, duration));
     }
 
     const span = Math.max(0, endSec - startSec);
-    // Apply the max-frames cap: increase interval if needed to stay under MAX_FRAMES
-    const effectiveInterval = clampToMaxFrames(baseInterval, span);
     const steps = Math.max(1, Math.floor(span / effectiveInterval));
     const autoNote = interval === AUTO_INTERVAL ? ` (auto: ${effectiveInterval}s for ${Math.round(duration / 60)}min video)` : "";
     setPhase(
@@ -1120,11 +1116,11 @@ export default function App() {
                   Capture interval
                 </label>
                 <div className="mt-2 flex gap-1.5">
-                  {/* Auto (adaptive) button */}
+                  {/* Auto button */}
                   <button
                     onClick={() => setIntervalVal(AUTO_INTERVAL)}
                     className={classNames(
-                      "px-3 py-2 rounded-lg text-sm border transition flex-1",
+                      "px-4 py-2 rounded-lg text-sm border transition flex-1",
                       interval === AUTO_INTERVAL
                         ? "bg-primary text-primary-foreground border-primary shadow"
                         : "bg-card border-border hover:bg-secondary",
@@ -1132,69 +1128,66 @@ export default function App() {
                   >
                     Auto
                   </button>
-                  {/* Preset buttons */}
-                  {PRESET_INTERVALS.map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => setIntervalVal(s)}
-                      className={classNames(
-                        "px-3 py-2 rounded-lg text-sm border transition flex-1",
-                        interval === s
-                          ? "bg-primary text-primary-foreground border-primary shadow"
-                          : "bg-card border-border hover:bg-secondary",
-                      )}
-                    >
-                      {s}s
-                    </button>
-                  ))}
+                  {/* Custom button */}
+                  <button
+                    onClick={() => {
+                      const parsed = parseInt(customInputStr, 10);
+                      setIntervalVal(parsed >= 1 ? parsed : 10);
+                    }}
+                    className={classNames(
+                      "px-4 py-2 rounded-lg text-sm border transition flex-1",
+                      interval !== AUTO_INTERVAL
+                        ? "bg-primary text-primary-foreground border-primary shadow"
+                        : "bg-card border-border hover:bg-secondary",
+                    )}
+                  >
+                    Custom
+                  </button>
                 </div>
 
-                {/* Auto mode: explain adaptive logic */}
+                {/* Auto mode: explain adaptive tiers */}
                 {interval === AUTO_INTERVAL && (
                   <div className="mt-2 rounded-md bg-card border border-border px-3 py-2 text-[11px] text-muted-foreground space-y-0.5">
-                    <p className="font-medium text-foreground">Adaptive interval (recommended)</p>
-                    <p>≤ 30 min video → 5 s &nbsp;|&nbsp; 30–90 min → 10 s &nbsp;|&nbsp; &gt; 90 min → 15 s</p>
+                    <p className="font-medium text-foreground">Adaptive (recommended)</p>
+                    <p>0–30 min → 10 s &nbsp;|&nbsp; 30–60 min → 15 s &nbsp;|&nbsp; 60+ min → 20 s</p>
                     {videoKnownDuration > 0 && (
                       <p className="text-foreground font-medium">
-                        This video ({formatTime(videoKnownDuration)}): using{" "}
-                        {clampToMaxFrames(getAdaptiveInterval(videoKnownDuration), videoKnownDuration)}s interval
-                        {" "}→ ~{Math.min(MAX_FRAMES, Math.ceil(videoKnownDuration / clampToMaxFrames(getAdaptiveInterval(videoKnownDuration), videoKnownDuration)))} frames
+                        This video ({formatTime(videoKnownDuration)}): will use{" "}
+                        {getAdaptiveInterval(videoKnownDuration)}s → ~{Math.ceil(videoKnownDuration / getAdaptiveInterval(videoKnownDuration))} frames
                       </p>
                     )}
                     {ytMeta && ytDuration > 0 && (
                       <p className="text-foreground font-medium">
-                        YouTube video ({formatTime(ytDuration)}): server will use{" "}
-                        {getAdaptiveInterval(ytDuration)}s interval
+                        YouTube ({formatTime(ytDuration)}): server will use{" "}
+                        {getAdaptiveInterval(ytDuration)}s
                       </p>
                     )}
                   </div>
                 )}
 
-                {/* Manual mode: show custom number input */}
+                {/* Custom mode: free-form seconds input, min 1, no max */}
                 {interval !== AUTO_INTERVAL && (
                   <div className="mt-2 flex items-center gap-2">
-                    <label className="text-[11px] text-muted-foreground shrink-0">
-                      Custom ({MIN_INTERVAL}–{MAX_INTERVAL}s):
-                    </label>
                     <input
                       type="number"
-                      min={MIN_INTERVAL}
-                      max={MAX_INTERVAL}
+                      min={1}
                       step={1}
-                      value={interval}
+                      value={customInputStr}
                       onChange={(e) => {
-                        const n = Number(e.target.value);
-                        if (Number.isFinite(n)) {
-                          setIntervalVal(
-                            Math.max(MIN_INTERVAL, Math.min(MAX_INTERVAL, Math.round(n))),
-                          );
-                        }
+                        const raw = e.target.value;
+                        setCustomInputStr(raw);
+                        const n = parseInt(raw, 10);
+                        if (Number.isFinite(n) && n >= 1) setIntervalVal(n);
+                      }}
+                      onBlur={() => {
+                        const n = parseInt(customInputStr, 10);
+                        const safe = Number.isFinite(n) && n >= 1 ? n : 10;
+                        setCustomInputStr(String(safe));
+                        setIntervalVal(safe);
                       }}
                       className="w-20 px-2 py-1 rounded-md bg-card border border-border text-sm outline-none focus:ring-2 focus:ring-ring"
                     />
-                    <span className="text-[11px] text-muted-foreground">
-                      seconds between frames
-                    </span>
+                    <span className="text-[11px] text-muted-foreground">seconds between frames</span>
                   </div>
                 )}
               </div>
@@ -1525,7 +1518,7 @@ export default function App() {
                   <p className="font-medium text-foreground">No notes yet.</p>
                   <ol className="list-decimal pl-5 space-y-1.5">
                     <li>Upload a video file.</li>
-                    <li>Pick an interval (5s recommended).</li>
+                    <li>Pick an interval (Auto is recommended).</li>
                     <li>Click <span className="text-foreground font-medium">Start Processing</span>.</li>
                     <li>Choose Smart or Exact mode.</li>
                     <li>Click <span className="text-foreground font-medium">Generate Notes</span>.</li>
