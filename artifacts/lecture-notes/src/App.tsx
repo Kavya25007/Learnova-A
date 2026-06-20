@@ -190,7 +190,9 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState<string>("");
   const [youtubeUrl, setYoutubeUrl] = useState<string>("");
   const [ytVideoError, setYtVideoError] = useState<string>("");
-  const [ytStreamLoading, setYtStreamLoading] = useState(false);
+  const [ytDownloadPct, setYtDownloadPct] = useState<number>(0);
+  const [ytTotalFrames, setYtTotalFrames] = useState<number>(0);
+  const sseRef = useRef<EventSource | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [interval, setIntervalVal] = useState<number>(10);
   const [mode, setMode] = useState<Mode>("smart");
@@ -333,6 +335,10 @@ export default function App() {
     setYtErrorStep("");
     setYtErrorMsg("");
     setYtVideoError("");
+    setYtDownloadPct(0);
+    setYtTotalFrames(0);
+    // close any live SSE connection
+    if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
   }
 
   // Enhance canvas contrast/brightness to improve OCR
@@ -356,16 +362,16 @@ export default function App() {
     }
   }
 
-  // ── YouTube server-side processing ──────────────────────────────────────────
-  // Downloads video + extracts frames on the server, skips the video element.
+  // ── YouTube SSE-based processing ────────────────────────────────────────────
+  // Architecture:
+  //   1. POST /api/youtube/start  → returns { jobId } immediately (no timeout risk)
+  //   2. EventSource /api/youtube/events/:jobId  → long-lived SSE stream
+  //      - "download_progress" events keep the connection alive during yt-dlp
+  //      - "frame" events arrive one-by-one as ffmpeg extracts them
+  //      - "done" event triggers the browser OCR pipeline
+  // This eliminates the proxy timeout that killed the old blocking-fetch approach.
   async function startYouTubeProcessing() {
     reset();
-    setProcessing(true);
-    cancelRef.current = false;
-    processingStartRef.current = Date.now();
-    elapsedTimerRef.current = window.setInterval(() => {
-      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
-    }, 1000);
 
     let startSec = 0;
     let endSec: number | null = null;
@@ -374,20 +380,27 @@ export default function App() {
       const e = parseTime(endTime);
       if (s == null || e == null || e <= s) {
         alert("Enter valid start and end times (mm:ss).");
-        setProcessing(false);
-        if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
         return;
       }
       startSec = s;
       endSec = e;
     }
 
+    setProcessing(true);
+    cancelRef.current = false;
+    processingStartRef.current = Date.now();
+    elapsedTimerRef.current = window.setInterval(() => {
+      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
+    }, 1000);
+
+    // ── Step 1: Start the job ────────────────────────────────────────────────
+    let jobId: string;
     try {
       setYtDownloadStatus("downloading");
-      setPhase("Downloading YouTube video on server...");
-      setProgress(10);
+      setPhase("Starting download...");
+      setProgress(5);
 
-      const res = await fetch(`${apiBase}/youtube/frames`, {
+      const startRes = await fetch(`${apiBase}/youtube/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -398,115 +411,190 @@ export default function App() {
         }),
       });
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({})) as {
-          error?: string; step?: string; videoId?: string;
-        };
-        const msg = err.error || `Server error (HTTP ${res.status})`;
+      if (!startRes.ok) {
+        const err = await startRes.json().catch(() => ({})) as { error?: string; step?: string };
+        const msg = err.error || `Server error (HTTP ${startRes.status})`;
         setYtDownloadStatus("error");
-        setYtExtractStatus("error");
-        setYtErrorStep(err.step || "unknown");
+        setYtErrorStep(err.step || "start");
         setYtErrorMsg(msg);
         setYtVideoError(msg);
         setPhase(`Failed: ${msg}`);
+        setProcessing(false);
+        if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
         return;
       }
-
-      setYtDownloadStatus("done");
-      setYtExtractStatus("extracting");
-      setPhase("Frames received. Running OCR...");
-      setProgress(30);
-
-      const data = await res.json() as {
-        frames: { timestamp: number; data: string }[];
-        videoId: string;
-        duration: number;
-        frameCount: number;
-      };
-
-      setYtExtractStatus("done");
-      setYtDuration(data.duration || 0);
-
-      if (!data.frames || data.frames.length === 0) {
-        setYtErrorMsg("No frames extracted from this video.");
-        setYtErrorStep("frame_extraction");
-        setPhase("No frames found.");
-        return;
-      }
-
-      // Build Frame objects from server-returned base64 images
-      const captured: Frame[] = data.frames.map((f) => ({
-        id: `yt-${f.timestamp}`,
-        timestamp: f.timestamp,
-        thumb: f.data,
-        hash: "",
-        text: "",
-        ocrProgress: 0,
-        ocrDone: false,
-      }));
-      setFrames([...captured]);
-      setStatFrames(captured.length);
-      setProgress(35);
-
-      setPhase(`Running OCR on ${captured.length} frames (${NUM_OCR_WORKERS} workers)`);
-
-      // Parallel OCR workers (same as file processing)
-      const workers = await Promise.all(
-        Array.from({ length: Math.min(NUM_OCR_WORKERS, captured.length) }, () =>
-          Tesseract.createWorker("eng"),
-        ),
-      );
-      try {
-        for (let i = 0; i < captured.length; i += workers.length) {
-          if (cancelRef.current) break;
-          await Promise.all(
-            captured.slice(i, i + workers.length).map(async (f, j) => {
-              const idx = i + j;
-              if (idx >= captured.length) return;
-              try {
-                const result = await workers[j].recognize(f.thumb);
-                captured[idx] = {
-                  ...captured[idx],
-                  text: (result.data.text || "").trim(),
-                  ocrProgress: 1,
-                  ocrDone: true,
-                };
-              } catch {
-                captured[idx] = { ...captured[idx], text: "", ocrProgress: 1, ocrDone: true };
-              }
-            }),
-          );
-          setFrames([...captured]);
-          const done = captured.filter((f) => f.ocrDone).length;
-          setStatOcr(done);
-          setProgress(35 + Math.round((done / captured.length) * 65));
-        }
-      } finally {
-        await Promise.all(workers.map((w) => w.terminate()));
-      }
-
-      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
-      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
-
-      const filtered = captured.filter((f) => f.text.replace(/\s+/g, "").length >= 8);
-      setFrames(filtered);
-      setStatFrames(filtered.length);
-      setPhase(
-        filtered.length
-          ? `Done. ${filtered.length} frame(s) with text.`
-          : "Done. No readable text found.",
-      );
+      const startData = await startRes.json() as { jobId: string };
+      jobId = startData.jobId;
     } catch (e) {
       const msg = `Network error: ${(e as Error).message}`;
       setYtDownloadStatus("error");
       setYtErrorStep("network");
       setYtErrorMsg(msg);
       setYtVideoError(msg);
-      setPhase("Network error.");
-    } finally {
+      setPhase("Could not reach server.");
       setProcessing(false);
       if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+      return;
     }
+
+    // ── Step 2: Open EventSource and collect frames ──────────────────────────
+    const capturedRef: Frame[] = [];
+    let totalExpected = 0;
+
+    await new Promise<void>((resolve) => {
+      const sse = new EventSource(`${apiBase}/youtube/events/${jobId}`);
+      sseRef.current = sse;
+
+      sse.addEventListener("status", (e: MessageEvent) => {
+        if (cancelRef.current) { sse.close(); resolve(); return; }
+        const d = JSON.parse(e.data) as { step: string; message: string };
+        if (d.step === "downloading") {
+          setYtDownloadStatus("downloading");
+          setPhase("Downloading video from YouTube...");
+          setProgress(10);
+        } else if (d.step === "extracting") {
+          setYtDownloadStatus("done");
+          setYtExtractStatus("extracting");
+          setPhase("Extracting frames...");
+          setProgress(50);
+        }
+      });
+
+      sse.addEventListener("download_progress", (e: MessageEvent) => {
+        if (cancelRef.current) { sse.close(); resolve(); return; }
+        const d = JSON.parse(e.data) as { pct: number; speed?: string; eta?: string };
+        setYtDownloadPct(d.pct);
+        const speed = d.speed ? ` at ${d.speed}` : "";
+        const eta = d.eta ? ` — ETA ${d.eta}` : "";
+        setPhase(`Downloading${speed}${eta}`);
+        setProgress(10 + Math.round(d.pct * 0.38));
+      });
+
+      sse.addEventListener("frame_count", (e: MessageEvent) => {
+        const d = JSON.parse(e.data) as { count: number; duration: number };
+        totalExpected = d.count;
+        setYtTotalFrames(d.count);
+        setYtDuration(d.duration);
+        setYtExtractStatus("done");
+        setPhase(`Receiving ${d.count} frame(s)...`);
+        setProgress(50);
+      });
+
+      sse.addEventListener("frame", (e: MessageEvent) => {
+        if (cancelRef.current) { sse.close(); resolve(); return; }
+        const d = JSON.parse(e.data) as { index: number; timestamp: number; data: string };
+        const frame: Frame = {
+          id: `yt-${d.timestamp.toFixed(2)}`,
+          timestamp: d.timestamp,
+          thumb: d.data,
+          hash: "",
+          text: "",
+          ocrProgress: 0,
+          ocrDone: false,
+        };
+        capturedRef.push(frame);
+        setStatFrames(capturedRef.length);
+        const pct = totalExpected > 0 ? Math.round((capturedRef.length / totalExpected) * 30) : 0;
+        setProgress(50 + pct);
+        setPhase(`Receiving frames (${capturedRef.length}/${totalExpected || "?"})`);
+      });
+
+      sse.addEventListener("done", () => {
+        sse.close();
+        sseRef.current = null;
+        resolve();
+      });
+
+      sse.addEventListener("error", (e: MessageEvent) => {
+        // This fires on both SSE protocol errors AND custom "error" events
+        // Check if it has data (custom event) vs network error (no data)
+        if (e.data) {
+          const d = JSON.parse(e.data) as { step: string; message: string };
+          setYtDownloadStatus("error");
+          setYtExtractStatus("error");
+          setYtErrorStep(d.step);
+          setYtErrorMsg(d.message);
+          setYtVideoError(d.message);
+          setPhase(`Failed: ${d.message}`);
+        } else {
+          // Network-level SSE error (e.g. server crash)
+          const msg = "Connection to server was lost. Please try again.";
+          setYtDownloadStatus("error");
+          setYtErrorStep("connection");
+          setYtErrorMsg(msg);
+          setYtVideoError(msg);
+          setPhase("Connection lost.");
+        }
+        sse.close();
+        sseRef.current = null;
+        resolve();
+      });
+    });
+
+    // ── Step 3: Run OCR on all collected frames ───────────────────────────────
+    if (cancelRef.current || capturedRef.length === 0) {
+      if (cancelRef.current) {
+        setPhase("Cancelled.");
+      } else if (capturedRef.length === 0 && !ytErrorMsg) {
+        setYtErrorMsg("No frames were received.");
+        setPhase("No frames received.");
+      }
+      setProcessing(false);
+      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+      return;
+    }
+
+    setFrames([...capturedRef]);
+    setPhase(`Running OCR on ${capturedRef.length} frame(s) (${NUM_OCR_WORKERS} workers)`);
+    setProgress(80);
+
+    const workers = await Promise.all(
+      Array.from({ length: Math.min(NUM_OCR_WORKERS, capturedRef.length) }, () =>
+        Tesseract.createWorker("eng"),
+      ),
+    );
+
+    try {
+      for (let i = 0; i < capturedRef.length; i += workers.length) {
+        if (cancelRef.current) break;
+        await Promise.all(
+          capturedRef.slice(i, i + workers.length).map(async (f, j) => {
+            const idx = i + j;
+            if (idx >= capturedRef.length) return;
+            try {
+              const result = await workers[j].recognize(f.thumb);
+              capturedRef[idx] = {
+                ...capturedRef[idx],
+                text: (result.data.text || "").trim(),
+                ocrProgress: 1,
+                ocrDone: true,
+              };
+            } catch {
+              capturedRef[idx] = { ...capturedRef[idx], text: "", ocrProgress: 1, ocrDone: true };
+            }
+          }),
+        );
+        setFrames([...capturedRef]);
+        const done = capturedRef.filter((f) => f.ocrDone).length;
+        setStatOcr(done);
+        setProgress(80 + Math.round((done / capturedRef.length) * 20));
+      }
+    } finally {
+      await Promise.all(workers.map((w) => w.terminate()));
+    }
+
+    if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+    setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
+
+    const filtered = capturedRef.filter((f) => f.text.replace(/\s+/g, "").length >= 8);
+    setFrames(filtered);
+    setStatFrames(filtered.length);
+    setPhase(
+      filtered.length
+        ? `Done. ${filtered.length} frame(s) with text.`
+        : "Done. No readable text found.",
+    );
+    setProcessing(false);
   }
 
   async function startProcessing() {
@@ -883,48 +971,64 @@ export default function App() {
                   <p className="text-xs text-destructive font-medium">{ytMetaError}</p>
                 )}
 
-                {/* Debug / status panel */}
-                {ytVideoId && (
-                  <div className="rounded-lg border border-border bg-card/60 p-3 text-[11px] space-y-1.5 font-mono">
-                    <p className="font-sans text-[11px] text-muted-foreground font-semibold tracking-wide uppercase mb-2">
+                {/* Processing status panel — shown once processing starts */}
+                {ytVideoId && processing && (
+                  <div className="rounded-lg border border-border bg-card/60 p-3 text-[11px] space-y-2">
+                    <p className="text-[11px] text-muted-foreground font-semibold tracking-wide uppercase">
                       Processing status
                     </p>
-                    <div className="flex justify-between">
-                      <span className="text-muted-foreground">Video ID</span>
-                      <span className="text-foreground">{ytVideoId}</span>
+
+                    {/* Download row with progress bar */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Download</span>
+                        <span className={
+                          ytDownloadStatus === "error" ? "text-destructive" :
+                          ytDownloadStatus === "done" ? "text-green-500" :
+                          ytDownloadStatus === "downloading" ? "text-yellow-500" :
+                          "text-muted-foreground"
+                        }>
+                          {ytDownloadStatus === "idle" ? "Waiting" :
+                           ytDownloadStatus === "downloading" ? `${Math.round(ytDownloadPct)}%` :
+                           ytDownloadStatus === "done" ? "Complete" : "Error"}
+                        </span>
+                      </div>
+                      {ytDownloadStatus === "downloading" && (
+                        <div className="w-full h-1.5 rounded-full bg-border overflow-hidden">
+                          <div
+                            className="h-full bg-yellow-500 rounded-full transition-all duration-300"
+                            style={{ width: `${ytDownloadPct}%` }}
+                          />
+                        </div>
+                      )}
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-muted-foreground">Metadata</span>
-                      <span className={ytMetaError ? "text-destructive" : ytMeta ? "text-green-500" : "text-muted-foreground"}>
-                        {ytMetaError ? "Error" : ytMeta ? "Loaded" : ytMetaLoading ? "Loading..." : "Pending"}
-                      </span>
+
+                    {/* Frame extraction row */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Frame extraction</span>
+                        <span className={
+                          ytExtractStatus === "error" ? "text-destructive" :
+                          ytExtractStatus === "done" ? "text-green-500" :
+                          ytExtractStatus === "extracting" ? "text-yellow-500" :
+                          "text-muted-foreground"
+                        }>
+                          {ytExtractStatus === "idle" ? "Waiting" :
+                           ytExtractStatus === "extracting"
+                             ? `${statFrames}${ytTotalFrames > 0 ? `/${ytTotalFrames}` : ""} frames`
+                             : ytExtractStatus === "done" ? `${statFrames} frames` : "Error"}
+                        </span>
+                      </div>
+                      {ytExtractStatus === "extracting" && ytTotalFrames > 0 && (
+                        <div className="w-full h-1.5 rounded-full bg-border overflow-hidden">
+                          <div
+                            className="h-full bg-yellow-500 rounded-full transition-all duration-300"
+                            style={{ width: `${Math.round((statFrames / ytTotalFrames) * 100)}%` }}
+                          />
+                        </div>
+                      )}
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-muted-foreground">Download</span>
-                      <span className={
-                        ytDownloadStatus === "error" ? "text-destructive" :
-                        ytDownloadStatus === "done" ? "text-green-500" :
-                        ytDownloadStatus === "downloading" ? "text-yellow-500" :
-                        "text-muted-foreground"
-                      }>
-                        {ytDownloadStatus === "idle" ? "Waiting" :
-                         ytDownloadStatus === "downloading" ? "In progress..." :
-                         ytDownloadStatus === "done" ? "Complete" : "Error"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-muted-foreground">Frame extraction</span>
-                      <span className={
-                        ytExtractStatus === "error" ? "text-destructive" :
-                        ytExtractStatus === "done" ? "text-green-500" :
-                        ytExtractStatus === "extracting" ? "text-yellow-500" :
-                        "text-muted-foreground"
-                      }>
-                        {ytExtractStatus === "idle" ? "Waiting" :
-                         ytExtractStatus === "extracting" ? "In progress..." :
-                         ytExtractStatus === "done" ? `Done (${statFrames} frames)` : "Error"}
-                      </span>
-                    </div>
+
                     {ytDuration > 0 && (
                       <div className="flex justify-between">
                         <span className="text-muted-foreground">Duration</span>

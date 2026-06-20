@@ -1,12 +1,61 @@
-import { Router, type IRouter } from "express";
-import { execFile, spawn } from "child_process";
+import { Router, type IRouter, type Request, type Response } from "express";
+import { spawn } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { mkdir, rm, readdir, readFile } from "fs/promises";
+import { randomUUID } from "crypto";
 import { openai } from "@workspace/integrations-openai-ai-server";
 
 const execFileAsync = promisify(execFile);
 const router: IRouter = Router();
 
+// ─── In-memory job store ─────────────────────────────────────────────────────
+// Each job accumulates SSE event strings. Active SSE connections register a
+// listener function so they get events pushed immediately. Late connections
+// replay the full event log from the start.
+
+interface YtJob {
+  status: "queued" | "downloading" | "extracting" | "done" | "error";
+  events: string[]; // accumulated SSE event strings (replayed to late connections)
+  listeners: Set<(ev: string) => void>;
+  tmpDir: string;
+  createdAt: number;
+}
+
+const jobs = new Map<string, YtJob>();
+
+// Cleanup stale jobs (older than 15 min)
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [id, job] of jobs) {
+    if (job.createdAt < cutoff) {
+      rm(job.tmpDir, { recursive: true, force: true }).catch(() => {});
+      jobs.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+function pushEvent(job: YtJob, name: string, data: unknown) {
+  const str = `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+  job.events.push(str);
+  for (const fn of job.listeners) fn(str);
+}
+
+// ─── SSE helpers ─────────────────────────────────────────────────────────────
+function startSSE(res: Response) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no"); // disable nginx/Caddy buffering
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+}
+
+function heartbeat(res: Response): ReturnType<typeof setInterval> {
+  // Send a comment every 20 s to keep the proxy connection alive
+  return setInterval(() => { res.write(": heartbeat\n\n"); }, 20_000);
+}
+
+// ─── Notes generation ─────────────────────────────────────────────────────────
 type NoteMode = "smart" | "exact" | "detailed" | "exam" | "flashcards" | "quiz";
 
 const NOTES_SYSTEM: Record<NoteMode, string> = {
@@ -102,8 +151,6 @@ QUIZ MODE rules:
 Output ONLY the quiz in the format above. No preamble.`,
 };
 
-// ─── Notes generation ────────────────────────────────────────────────────────
-
 router.post("/notes/generate", async (req, res) => {
   try {
     const body = req.body as {
@@ -149,7 +196,6 @@ router.post("/notes/generate", async (req, res) => {
 });
 
 // ─── YouTube metadata ─────────────────────────────────────────────────────────
-
 router.get("/youtube/meta", async (req, res) => {
   const url = req.query.url as string;
   if (!url) { res.status(400).json({ error: "Missing url", step: "url_validation" }); return; }
@@ -160,16 +206,13 @@ router.get("/youtube/meta", async (req, res) => {
   const videoId = m[1];
 
   try {
-    req.log.info({ videoId }, "Fetching YouTube metadata via oEmbed");
     const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
     const resp = await fetch(oembedUrl);
     if (!resp.ok) {
-      req.log.warn({ videoId, status: resp.status }, "oEmbed returned non-OK status");
       res.status(404).json({ error: "Video not found or unavailable", step: "metadata", videoId });
       return;
     }
     const data = (await resp.json()) as { title?: string; author_name?: string; thumbnail_url?: string };
-    req.log.info({ videoId, title: data.title }, "YouTube metadata fetched");
     res.json({ title: data.title ?? "", channel: data.author_name ?? "", thumbnail: data.thumbnail_url ?? "", videoId });
   } catch (err) {
     req.log.error({ err }, "youtube meta failed");
@@ -177,12 +220,12 @@ router.get("/youtube/meta", async (req, res) => {
   }
 });
 
-// ─── YouTube server-side frame extraction ────────────────────────────────────
-// Downloads video with yt-dlp, extracts frames with ffmpeg, returns base64.
-// The client feeds these frames directly into its Tesseract OCR pipeline —
-// no browser video element or streaming proxy needed.
+// ─── YouTube job start ────────────────────────────────────────────────────────
+// Creates a background job, returns immediately with a jobId.
+// The client then opens GET /api/youtube/events/:jobId as an SSE stream.
+// This avoids any proxy timeout — SSE connections are long-lived by design.
 
-router.post("/youtube/frames", async (req, res) => {
+router.post("/youtube/start", async (req: Request, res: Response) => {
   const { url, interval: rawInterval, startTime: rawStart, endTime: rawEnd } = req.body as {
     url?: string;
     interval?: number;
@@ -190,172 +233,227 @@ router.post("/youtube/frames", async (req, res) => {
     endTime?: number;
   };
 
-  // Step 1: URL validation
-  if (!url) {
-    req.log.warn("youtube/frames: missing url");
-    res.status(400).json({ error: "Missing url", step: "url_validation" });
-    return;
-  }
+  if (!url) { res.status(400).json({ error: "Missing url", step: "url_validation" }); return; }
+
   const ytRx = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/;
   const m = url.match(ytRx);
-  if (!m) {
-    req.log.warn({ url }, "youtube/frames: invalid URL");
-    res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" });
-    return;
-  }
+  if (!m) { res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" }); return; }
   const videoId = m[1];
+
   const effectiveInterval = Math.max(1, Math.round(Number(rawInterval) || 10));
   const startSec = Math.max(0, Number(rawStart) || 0);
-  const endSec = rawEnd != null ? Math.max(startSec + 1, Number(rawEnd)) : null;
+  const endSec: number | null = rawEnd != null && rawEnd !== undefined ? Math.max(startSec + 1, Number(rawEnd)) : null;
 
-  req.log.info({ videoId, effectiveInterval, startSec, endSec }, "YouTube frame extraction requested");
+  const jobId = randomUUID();
+  const tmpDir = `/tmp/yt-${videoId}-${jobId.slice(0, 8)}`;
+  const job: YtJob = {
+    status: "queued",
+    events: [],
+    listeners: new Set(),
+    tmpDir,
+    createdAt: Date.now(),
+  };
+  jobs.set(jobId, job);
 
-  const tmpDir = `/tmp/yt-${videoId}-${Date.now()}`;
-  const videoPath = `${tmpDir}/video.mp4`;
-  const framesDir = `${tmpDir}/frames`;
+  req.log.info({ jobId, videoId, effectiveInterval, startSec, endSec }, "YouTube job created");
+  res.json({ jobId, videoId });
+
+  // Run processing asynchronously — completely detached from the HTTP response
+  runYouTubeJob(jobId, job, { url, videoId, effectiveInterval, startSec, endSec }, req.log).catch(
+    (err) => req.log.error({ err, jobId }, "Unhandled error in YouTube job"),
+  );
+});
+
+// ─── YouTube SSE event stream ─────────────────────────────────────────────────
+// Events emitted:
+//   status          { step: string; message: string }
+//   download_progress { pct: number; speed?: string; eta?: string }
+//   frame_count     { count: number; duration: number }
+//   frame           { index: number; timestamp: number; data: string } (base64 JPEG)
+//   done            { frameCount: number; duration: number }
+//   error           { step: string; message: string }
+
+router.get("/youtube/events/:jobId", (req: Request, res: Response) => {
+  const job = jobs.get(req.params["jobId"] as string);
+  if (!job) { res.status(404).json({ error: "Job not found" }); return; }
+
+  startSSE(res);
+  const hb = heartbeat(res);
+
+  // Replay all events queued before this connection arrived
+  for (const ev of job.events) res.write(ev);
+
+  // Register for future events
+  const listener = (ev: string) => { res.write(ev); };
+  job.listeners.add(listener);
+
+  req.on("close", () => {
+    clearInterval(hb);
+    job.listeners.delete(listener);
+  });
+});
+
+// ─── Background job runner ────────────────────────────────────────────────────
+async function runYouTubeJob(
+  jobId: string,
+  job: YtJob,
+  opts: { url: string; videoId: string; effectiveInterval: number; startSec: number; endSec: number | null },
+  log: Request["log"],
+) {
+  const { url, videoId, effectiveInterval, startSec, endSec } = opts;
+  const videoPath = `${job.tmpDir}/video.mp4`;
+  const framesDir = `${job.tmpDir}/frames`;
 
   try {
     await mkdir(framesDir, { recursive: true });
 
-    // Step 2: Download video
-    req.log.info({ videoId }, "Starting yt-dlp download");
-    try {
-      await execFileAsync("yt-dlp", [
+    // ── Phase 1: Download ────────────────────────────────────────────────────
+    job.status = "downloading";
+    pushEvent(job, "status", { step: "downloading", message: "Downloading video from YouTube..." });
+
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn("yt-dlp", [
         "--no-playlist",
+        "--newline",
         "--no-check-certificate",
         "--format",
         "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best",
         "--merge-output-format", "mp4",
         "--output", videoPath,
         url,
-      ], { timeout: 300_000 });
-      req.log.info({ videoId }, "yt-dlp download complete");
-    } catch (err: unknown) {
-      const raw = err as { stderr?: string; stdout?: string; message?: string };
-      const msg = String(raw.stderr || raw.message || err);
-      req.log.error({ videoId, msg: msg.slice(0, 500) }, "yt-dlp download failed");
-      if (/private video|video is private/i.test(msg)) {
-        res.status(403).json({ error: "This video is private", step: "download", videoId });
-      } else if (/age.?restrict|confirm your age|sign in/i.test(msg)) {
-        res.status(403).json({ error: "This video is age-restricted", step: "download", videoId });
-      } else if (/unavailable|not available|removed|banned/i.test(msg)) {
-        res.status(404).json({ error: "This video is unavailable or has been removed", step: "download", videoId });
-      } else if (/copyright/i.test(msg)) {
-        res.status(451).json({ error: "This video is blocked due to copyright", step: "download", videoId });
-      } else {
-        res.status(500).json({
-          error: `Download failed. yt-dlp output: ${msg.slice(0, 300)}`,
-          step: "download",
-          videoId,
-        });
-      }
-      return;
-    }
+      ]);
 
-    // Step 3: Get video duration via ffprobe
+      let stderr = "";
+
+      proc.stdout.on("data", (chunk: Buffer) => {
+        const text = chunk.toString();
+        // Parse progress lines: "[download]  45.3% of ~42.32MiB at 1.23MiB/s ETA 00:30"
+        const pctM = text.match(/\[download\]\s+([\d.]+)%/);
+        if (pctM) {
+          const speedM = text.match(/at\s+([\d.]+\s*\S+\/s)/);
+          const etaM = text.match(/ETA\s+(\S+)/);
+          pushEvent(job, "download_progress", {
+            pct: parseFloat(pctM[1]),
+            speed: speedM?.[1],
+            eta: etaM?.[1],
+          });
+        }
+      });
+
+      proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+      proc.on("close", (code) => {
+        if (code === 0) { resolve(); return; }
+        reject(new Error(stderr || `yt-dlp exited with code ${code}`));
+      });
+      proc.on("error", (err) => reject(err));
+    }).catch((err: Error) => {
+      const msg = err.message;
+      let userMsg: string;
+      let step = "download";
+      if (/private video|video is private/i.test(msg)) userMsg = "This video is private.";
+      else if (/age.?restrict|confirm your age|sign in/i.test(msg)) userMsg = "This video is age-restricted.";
+      else if (/unavailable|not available|removed|banned/i.test(msg)) userMsg = "This video is unavailable or has been removed.";
+      else if (/copyright/i.test(msg)) userMsg = "This video is blocked due to copyright.";
+      else userMsg = `Download failed: ${msg.slice(0, 200)}`;
+      pushEvent(job, "error", { step, message: userMsg });
+      job.status = "error";
+      throw new Error("__handled__");
+    });
+
+    // ── Phase 2: Get duration via ffprobe ────────────────────────────────────
     let duration = 0;
     try {
       const { stdout } = await execFileAsync("ffprobe", [
-        "-v", "quiet",
-        "-print_format", "json",
-        "-show_format",
-        videoPath,
+        "-v", "quiet", "-print_format", "json", "-show_format", videoPath,
       ], { timeout: 15_000 });
       const probe = JSON.parse(stdout) as { format?: { duration?: string } };
       duration = parseFloat(probe.format?.duration ?? "0") || 0;
-      req.log.info({ videoId, duration }, "ffprobe duration");
-    } catch (err) {
-      req.log.warn({ err }, "ffprobe failed; duration unknown");
-    }
+    } catch { /* non-fatal */ }
 
-    // Step 4: Extract frames
+    // ── Phase 3: Extract frames ───────────────────────────────────────────────
+    job.status = "extracting";
+    pushEvent(job, "status", { step: "extracting", message: "Extracting frames from video..." });
+
     const actualEnd = endSec != null ? Math.min(endSec, duration || endSec) : duration;
     const seekArg = startSec > 0 ? ["-ss", String(startSec)] : [];
-    const durationArg =
-      actualEnd > startSec ? ["-t", String(actualEnd - startSec)] : [];
+    const durArg = actualEnd > startSec ? ["-t", String(actualEnd - startSec)] : [];
 
     const ffmpegArgs = [
       "-loglevel", "warning",
       ...seekArg,
       "-i", videoPath,
-      ...durationArg,
+      ...durArg,
       "-vf", `fps=1/${effectiveInterval},scale='min(960\\,iw)':-2`,
       "-qscale:v", "5",
       "-f", "image2",
       `${framesDir}/frame_%04d.jpg`,
     ];
 
-    req.log.info({ videoId, ffmpegArgs: ffmpegArgs.join(" ") }, "Starting ffmpeg frame extraction");
-    try {
-      const { stderr } = await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 120_000 });
-      if (stderr) req.log.debug({ videoId, stderr: stderr.slice(0, 500) }, "ffmpeg stderr");
-      req.log.info({ videoId }, "ffmpeg frame extraction complete");
-    } catch (err: unknown) {
-      const raw = err as { stderr?: string; message?: string };
-      const msg = String(raw.stderr || raw.message || err);
-      req.log.error({ videoId, msg: msg.slice(0, 500) }, "ffmpeg frame extraction failed");
-      res.status(500).json({
-        error: `Frame extraction failed: ${msg.slice(0, 200)}`,
-        step: "frame_extraction",
-        videoId,
-      });
-      return;
-    }
+    await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 120_000 }).catch((err: Error) => {
+      pushEvent(job, "error", { step: "frame_extraction", message: `Frame extraction failed: ${err.message.slice(0, 200)}` });
+      job.status = "error";
+      throw new Error("__handled__");
+    });
 
-    // Step 5: Read frames and encode as base64
-    let frameFiles: string[] = [];
-    try {
-      frameFiles = (await readdir(framesDir))
-        .filter((f) => f.endsWith(".jpg"))
-        .sort();
-    } catch (err) {
-      req.log.error({ err }, "Failed to read frames directory");
-      res.status(500).json({ error: "Could not read extracted frames", step: "frame_read", videoId });
-      return;
-    }
+    // ── Phase 4: Stream frames to SSE clients ─────────────────────────────────
+    const frameFiles = (await readdir(framesDir))
+      .filter((f) => f.endsWith(".jpg"))
+      .sort();
 
     if (frameFiles.length === 0) {
-      req.log.warn({ videoId }, "No frames extracted — video may have no visual content");
-      res.status(422).json({
-        error: "No frames could be extracted from this video. Try a shorter time range or different interval.",
+      pushEvent(job, "error", {
         step: "frame_extraction",
-        videoId,
-        duration,
+        message: "No frames could be extracted. Try a different interval or time range.",
       });
+      job.status = "error";
       return;
     }
 
-    req.log.info({ videoId, frameCount: frameFiles.length }, "Encoding frames to base64");
-    const frames = await Promise.all(
-      frameFiles.map(async (file, i) => {
-        const data = await readFile(`${framesDir}/${file}`);
-        const timestamp = startSec + i * effectiveInterval;
-        return {
-          timestamp,
-          data: `data:image/jpeg;base64,${data.toString("base64")}`,
-        };
-      }),
-    );
+    pushEvent(job, "frame_count", { count: frameFiles.length, duration });
+    log.info({ jobId, videoId, frameCount: frameFiles.length }, "Streaming frames to clients");
 
-    req.log.info({ videoId, frameCount: frames.length }, "YouTube frames ready");
-    res.json({ frames, videoId, duration, frameCount: frames.length });
-  } catch (err) {
-    req.log.error({ err }, "Unexpected error in youtube/frames");
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Unexpected server error", step: "unknown", videoId });
+    for (let i = 0; i < frameFiles.length; i++) {
+      const data = await readFile(`${framesDir}/${frameFiles[i]}`);
+      const timestamp = startSec + i * effectiveInterval;
+      pushEvent(job, "frame", {
+        index: i,
+        timestamp,
+        data: `data:image/jpeg;base64,${data.toString("base64")}`,
+      });
+      // Yield the event loop briefly every 5 frames to avoid blocking
+      if (i % 5 === 4) await new Promise((r) => setImmediate(r));
+    }
+
+    // ── Done ─────────────────────────────────────────────────────────────────
+    job.status = "done";
+    pushEvent(job, "done", { frameCount: frameFiles.length, duration });
+    log.info({ jobId, videoId, frameCount: frameFiles.length }, "YouTube job complete");
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message === "__handled__") return;
+    log.error({ err, jobId }, "Unexpected error in YouTube job");
+    if (job.status !== "error") {
+      pushEvent(job, "error", { step: "unknown", message: "An unexpected server error occurred." });
+      job.status = "error";
     }
   } finally {
-    rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    rm(job.tmpDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+// ─── Legacy endpoint (deprecated) ────────────────────────────────────────────
+router.get("/youtube/stream", (_req, res) => {
+  res.status(410).json({ error: "Use POST /api/youtube/start + GET /api/youtube/events/:jobId instead." });
 });
 
-// ─── YouTube stream (legacy — kept for reference, no longer used by client) ──
-router.get("/youtube/stream", (_req, res) => {
-  res.status(410).json({ error: "YouTube streaming is no longer used. Use POST /api/youtube/frames instead." });
+// Compatibility: the old single-shot frames endpoint now delegates to the same job pipeline
+router.post("/youtube/frames", (_req, res) => {
+  res.status(410).json({
+    error: "Use POST /api/youtube/start + GET /api/youtube/events/:jobId (SSE) instead.",
+  });
 });
 
 // ─── Assistant chat ───────────────────────────────────────────────────────────
-
 const ASSISTANT_SYSTEM = `You are an AI assistant inside a Smart Lecture Notes Generator web app.
 Help users navigate the app, answer questions about their generated notes, and explain study concepts.
 App workflow:
