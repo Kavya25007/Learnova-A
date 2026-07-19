@@ -1,0 +1,65 @@
+Add premium micro-interactions and animations throughout the application while maintaining a clean and professional design.
+
+The animations should feel similar to modern SaaS products like Notion, Linear, Vercel, Apple, and Perplexity.
+
+Do not use balloons, cartoon animations, excessive confetti, or flashy effects.
+
+Use elegant animations such as:
+
+• Smooth fade-in and slide-up transitions
+• Card hover elevation with soft shadows
+• Button hover and click animations
+• Smooth page transitions
+• Animated progress indicators
+• Skeleton loaders while content is loading
+• Gentle glow effects for important actions
+• Smooth loading transitions between processing stages
+
+Success Experience:
+
+When AI finishes generating the notes, display a premium success animation for approximately 1.5–2 seconds.
+
+Show a centered success modal with:
+
+✅ Your Notes Are Ready!
+
+Your AI notes have been generated successfully.
+
+Use a subtle success animation consisting of:
+
+• A glowing animated checkmark
+• Soft sparkle particles (very minimal)
+• A gentle expanding success ring
+• Smooth fade-in and fade-out transitions
+
+After approximately 2 seconds, automatically transition to the generated notes page.
+
+The success animation should feel satisfying, elegant, and premium—not like a celebration or party.
+
+Processing Experience:
+
+Instead of showing technical messages, present the AI workflow in a user-friendly way:
+
+🎥 Reading your lecture...
+📄 Detecting important slides...
+🔍 Extracting text...
+🧠 Understanding concepts...
+📝 Creating structured notes...
+✨ Finalizing your notes...
+
+Animate each stage with smooth transitions and update the progress bar accordingly.
+
+The UI should feel alive through subtle movement, not excessive animation.
+
+Focus on refinement rather than decoration.
+
+Every animation should have a purpose: improve usability, provide feedback, or create a polished experience.
+
+Avoid:
+- Balloons
+- Heavy confetti
+- Fireworks
+- Neon effects
+- Large particle systems
+- Excessive motion
+- Long animation durations
