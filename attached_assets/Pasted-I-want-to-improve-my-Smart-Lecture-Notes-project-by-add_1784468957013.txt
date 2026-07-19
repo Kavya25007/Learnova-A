@@ -1,0 +1,39 @@
+I want to improve my Smart Lecture Notes project by adding seamless YouTube processing without changing the existing UI or breaking the current video upload workflow.
+
+Current behavior:
+- Uploading a local video works perfectly.
+- Pasting a YouTube URL only fetches the title and thumbnail for preview.
+- The app cannot process YouTube videos because browser-side frame extraction is blocked by CORS.
+
+I want to change the architecture.
+
+New workflow:
+
+1. When the user pastes a YouTube URL and clicks Start Processing, the backend should automatically download the video temporarily without requiring the user to download it manually.
+2. This download should happen completely in the background. The user should only see a loading/progress indicator such as "Processing YouTube video...".
+3. Save the downloaded file in a temporary location.
+4. Reuse the existing frame extraction, OCR, deduplication, and AI note generation pipeline that already works for uploaded videos.
+5. After processing finishes, automatically delete the temporary video file.
+6. Return the generated notes exactly the same way as uploaded videos.
+7. Do NOT change the frontend design unless absolutely necessary. Keep the current UI and user experience.
+8. Preserve all existing features including:
+   - Smart mode
+   - Exact mode
+   - Full video processing
+   - Custom time range
+   - OCR
+   - Deduplication
+   - Markdown generation
+9. The uploaded video workflow must continue to work exactly as before.
+
+Implementation requirements:
+- Implement the YouTube download on the backend only.
+- Use yt-dlp to download the best available MP4.
+- Use ffmpeg if needed for processing.
+- Handle errors gracefully (invalid URL, unavailable video, private video, download failure, etc.).
+- Clean up temporary files after processing.
+- Reuse as much existing code as possible instead of creating a completely separate processing pipeline.
+- Follow the existing project structure and coding style.
+
+Important:
+Do not rewrite the entire project. Modify only the necessary backend and frontend files so that both local uploads and YouTube URLs work using the same processing pipeline.
