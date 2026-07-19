@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Chat } from "./components/Chat";
 import Tesseract from "tesseract.js";
 import { Document, Paragraph, TextRun, HeadingLevel, Packer } from "docx";
 import {
@@ -9,7 +10,6 @@ import {
   Loader2,
   Sparkles,
   FileText,
-  MessageCircle,
   Send,
   Download,
   Copy,
@@ -17,7 +17,6 @@ import {
   Trash2,
   Youtube,
   X,
-  HelpCircle,
   Moon,
   Sun,
   Printer,
@@ -41,8 +40,6 @@ type Frame = {
   ocrProgress: number;
   ocrDone: boolean;
 };
-
-type ChatMessage = { role: "user" | "assistant"; content: string };
 
 // 0 = Auto (adaptive). Positive number = Custom seconds.
 const AUTO_INTERVAL = 0;
@@ -220,17 +217,6 @@ export default function App() {
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const [chatOpen, setChatOpen] = useState(false);
-  const [chat, setChat] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content:
-        "Hi! I am your notes assistant. Ask me how to use the app, or for tips on getting better notes.",
-    },
-  ]);
-  const [chatInput, setChatInput] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
-  const chatScrollRef = useRef<HTMLDivElement>(null);
   const [darkMode, setDarkMode] = useState(() =>
     document.documentElement.classList.contains("dark"),
   );
@@ -271,13 +257,6 @@ export default function App() {
     setVideoUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
-
-  useEffect(() => {
-    chatScrollRef.current?.scrollTo({
-      top: chatScrollRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [chat, chatLoading]);
 
   const ytEmbed = useMemo(() => {
     if (!youtubeUrl) return "";
@@ -825,37 +804,6 @@ export default function App() {
     }
   }
 
-  async function sendChat() {
-    const text = chatInput.trim();
-    if (!text || chatLoading) return;
-    const next: ChatMessage[] = [...chat, { role: "user", content: text }];
-    setChat(next);
-    setChatInput("");
-    setChatLoading(true);
-    try {
-      const res = await fetch(`${apiBase}/assistant/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: next, notes: notes || undefined }),
-      });
-      const data = await res.json();
-      setChat([
-        ...next,
-        {
-          role: "assistant",
-          content: data.content || "Sorry, I could not respond. Try again.",
-        },
-      ]);
-    } catch {
-      setChat([
-        ...next,
-        { role: "assistant", content: "Network error. Please try again." },
-      ]);
-    } finally {
-      setChatLoading(false);
-    }
-  }
-
   const totalText = frames.reduce((n, f) => n + f.text.length, 0);
 
   return (
@@ -883,13 +831,6 @@ export default function App() {
               title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
             >
               {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-            </button>
-            <button
-              onClick={() => setChatOpen(true)}
-              className="hidden sm:inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card hover:bg-secondary text-sm transition"
-            >
-              <HelpCircle className="w-4 h-4" />
-              Assistant
             </button>
           </div>
         </div>
@@ -1535,114 +1476,7 @@ export default function App() {
         </aside>
       </main>
 
-      {/* Floating chat button (mobile) */}
-      <button
-        onClick={() => setChatOpen(true)}
-        className="sm:hidden fixed bottom-5 right-5 w-12 h-12 rounded-full bg-primary text-primary-foreground shadow-lg grid place-items-center"
-      >
-        <MessageCircle className="w-5 h-5" />
-      </button>
-
-      {/* Chat panel */}
-      {chatOpen && (
-        <div className="fixed inset-0 z-40 flex justify-end" onClick={() => setChatOpen(false)}>
-          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" />
-          <div
-            className="relative w-full sm:max-w-md bg-card border-l border-border h-full flex flex-col shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="p-4 border-b border-border flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-md bg-primary/10 grid place-items-center text-primary">
-                  <MessageCircle className="w-4 h-4" />
-                </div>
-                <div>
-                  <p className="font-semibold text-sm">Notes Assistant</p>
-                  <p className="text-[11px] text-muted-foreground">
-                    Help with the app and tips
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setChatOpen(false)}
-                className="p-1.5 rounded-md hover:bg-secondary"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div ref={chatScrollRef} className="flex-1 overflow-auto p-4 space-y-3">
-              {chat.map((m, i) => (
-                <div
-                  key={i}
-                  className={classNames(
-                    "flex",
-                    m.role === "user" ? "justify-end" : "justify-start",
-                  )}
-                >
-                  <div
-                    className={classNames(
-                      "max-w-[85%] rounded-2xl px-3.5 py-2 text-sm leading-relaxed whitespace-pre-wrap",
-                      m.role === "user"
-                        ? "bg-primary text-primary-foreground rounded-br-sm"
-                        : "bg-secondary text-secondary-foreground rounded-bl-sm",
-                    )}
-                  >
-                    {m.content}
-                  </div>
-                </div>
-              ))}
-              {chatLoading && (
-                <div className="flex justify-start">
-                  <div className="bg-secondary text-secondary-foreground rounded-2xl rounded-bl-sm px-3.5 py-2 text-sm flex items-center gap-2">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Thinking...
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="p-3 border-t border-border">
-              <div className="flex items-end gap-2">
-                <textarea
-                  rows={1}
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      sendChat();
-                    }
-                  }}
-                  placeholder="Ask about intervals, modes, or how to use the app..."
-                  className="flex-1 resize-none px-3 py-2 rounded-lg bg-background border border-border outline-none focus:ring-2 focus:ring-ring text-sm max-h-32"
-                />
-                <button
-                  onClick={sendChat}
-                  disabled={!chatInput.trim() || chatLoading}
-                  className="p-2.5 rounded-lg bg-primary text-primary-foreground disabled:opacity-40 transition"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {[
-                  "How do I use this app?",
-                  "Notes look repetitive — fix?",
-                  "Best interval for slides?",
-                ].map((q) => (
-                  <button
-                    key={q}
-                    onClick={() => setChatInput(q)}
-                    className="text-[11px] px-2 py-1 rounded-full border border-border bg-background hover:bg-secondary transition"
-                  >
-                    {q}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <Chat notes={notes} apiBase={apiBase} />
     </div>
   );
 }

@@ -1,0 +1,48 @@
+I want to replace the current assistant with a true conversational AI assistant.
+
+Do NOT build a chatbot that relies on predefined questions, keywords, or hardcoded responses.
+
+I want the assistant to behave like ChatGPT.
+
+Requirements:
+
+- Users should be able to ask anything naturally in their own words.
+- The AI should understand intent instead of matching fixed questions.
+- It should answer any question related to the application, including features, workflow, OCR, AI note generation, YouTube processing, capture intervals, accuracy, privacy, supported formats, limitations, troubleshooting, and best practices.
+- If multiple users ask the same question in different ways, the AI should still understand and answer correctly.
+
+For example, all of these should work naturally:
+- "How does this app work?"
+- "Can you explain what happens after I upload a video?"
+- "Why are some slides skipped?"
+- "Why didn't OCR detect this text?"
+- "Which interval should I use for programming lectures?"
+- "Is my video stored anywhere?"
+- "How accurate is this?"
+- "Can I use a YouTube link?"
+- "Why is processing slow?"
+- "How are notes generated?"
+- "Can you explain Smart mode?"
+- "What's the difference between Smart and Exact mode?"
+
+The AI should not require these exact questions. It should understand similar or completely different wording.
+
+If the question is about the application, answer using knowledge of the application's architecture and features.
+
+If the user asks a general question (programming, studies, AI, DBMS, DSA, or any general knowledge), answer it normally using the OpenAI API instead of refusing.
+
+The assistant should maintain conversation history during the current session so follow-up questions make sense.
+
+The UI should feel like ChatGPT:
+- Floating AI button
+- Chat popup
+- Streaming responses
+- Typing indicator
+- Markdown support
+- Code blocks
+- Copy button
+- Clear chat
+- Responsive design
+- Modern animations
+
+Do not use hardcoded FAQs or keyword-based logic. The AI should rely on the LLM to understand and answer questions naturally.

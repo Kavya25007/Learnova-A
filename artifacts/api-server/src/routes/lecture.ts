@@ -457,18 +457,76 @@ router.post("/youtube/frames", (_req, res) => {
   });
 });
 
-// ─── Assistant chat ───────────────────────────────────────────────────────────
-const ASSISTANT_SYSTEM = `You are an AI assistant inside a Smart Lecture Notes Generator web app.
-Help users navigate the app, answer questions about their generated notes, and explain study concepts.
-App workflow:
-1. Upload a video file OR paste a YouTube URL (the app downloads and processes it server-side).
-2. Select a capture interval (default 10s).
-3. Optionally set a Custom Time Range.
-4. Click Start Processing — the app downloads the video, extracts frames, runs OCR, and deduplicates.
-5. Choose a note mode: Smart, Exact, Detailed, Exam Revision, Flashcards, or Quiz.
-6. Click Generate Notes.
-If the user pastes their notes, you can answer questions about them, explain concepts, or generate quizzes.
-Be friendly, concise, and step-by-step. No emojis.`;
+// ─── Assistant chat (streaming) ───────────────────────────────────────────────
+const ASSISTANT_SYSTEM = `You are a smart, helpful AI assistant built into the "Smart Lecture Notes Generator" web application. You have complete knowledge of this application's architecture, features, and limitations.
+
+## About the Application
+Smart Lecture Notes Generator converts lecture or tutorial videos into structured study notes through a pipeline of frame extraction, OCR, and AI summarization.
+
+## Full Workflow
+1. **Video Input**: Upload a local video file (MP4, WebM, MOV) OR paste a YouTube URL.
+2. **Capture Interval**: Choose Auto (adaptive based on video length) or a custom interval in seconds.
+3. **Frame Extraction**:
+   - *Local files*: The browser seeks the video at each interval, captures frames to a canvas element, and computes a perceptual hash to skip near-duplicate frames. No data is sent to any server.
+   - *YouTube*: The server uses yt-dlp (android client) to extract a direct CDN stream URL without downloading the full video, then ffmpeg extracts frames from that URL. Frames are sent to the browser as Server-Sent Events (SSE).
+4. **OCR**: Tesseract.js runs in the browser using 3 parallel web workers to extract text from each unique frame.
+5. **Note Generation**: All OCR text is sent to the backend, which uses OpenAI GPT to produce structured markdown notes in the chosen mode.
+
+## Adaptive Intervals (Auto Mode)
+- 0–30 min videos → 10 s interval
+- 30–60 min videos → 15 s interval
+- 60+ min videos → 20 s interval
+- Custom: any positive number of seconds
+
+## Note Modes
+- **Smart**: Concise, deduplicated — removes repetition, focuses on key ideas. Best for most lectures.
+- **Exact**: Full detail — preserves everything OCR found including all text and code snippets.
+- **Detailed**: Summary + key concepts — balanced between Smart and Exact.
+- **Exam Revision**: Common exam questions with answers and revision tips.
+- **Flashcards**: Q&A study cards formatted for spaced repetition practice.
+- **Quiz**: Multiple-choice questions generated from the video content.
+
+## YouTube Processing Details
+- yt-dlp extracts a direct playback URL using the android player client (bypasses datacenter IP restrictions that block standard downloads).
+- ffmpeg streams frames directly from the CDN URL — the full video is never stored on the server.
+- Frames are delivered to the browser in real time via SSE.
+- Only public, non-age-restricted, non-geo-blocked videos are supported.
+
+## Privacy
+- Local video files never leave the user's browser — all frame capture and OCR is client-side.
+- YouTube: frames are temporarily processed server-side and deleted immediately after streaming.
+- No notes or video data is stored persistently on any server.
+
+## Supported Formats
+- Local files: MP4, WebM, MOV (any format the browser's native video element can decode)
+- YouTube: any standard public YouTube URL (youtube.com/watch?v=..., youtu.be/...)
+
+## Common Issues & Troubleshooting
+- **OCR misses text / text not detected**: Video resolution or font may be too small or stylized. HD slides with clean sans-serif fonts give best results. Handwritten notes OCR poorly.
+- **Too many or too few frames**: Adjust the interval. Lower interval = more frames; higher = fewer frames.
+- **Duplicate slides appearing**: Increase the interval, or use Auto mode which adapts to video length.
+- **Frames being skipped**: Perceptual hash deduplication intentionally removes near-identical frames to avoid redundant notes. This is expected behavior.
+- **YouTube video fails**: The video may be private, age-restricted, geo-blocked, or a livestream. These cannot be processed.
+- **Processing is slow**: OCR runs on 3 parallel workers. Videos with many unique frames take more time. YouTube videos also require server-side frame extraction.
+- **Notes are repetitive in Exact mode**: Switch to Smart mode — it uses AI to deduplicate and summarize content.
+- **Notes are too short or incomplete**: Use Exact or Detailed mode for more comprehensive output.
+- **Code snippets look garbled**: OCR sometimes misreads code characters. Use Exact mode and manually verify important code.
+
+## Accuracy
+- OCR accuracy depends on video quality. 1080p slides with high-contrast text achieve ~95%+ accuracy. Low-resolution or visually busy backgrounds reduce accuracy.
+- AI note generation uses the OCR text as its input, so OCR errors can propagate into the notes. Smart mode mitigates this through AI summarization.
+
+## Best Practices
+- Coding tutorials: use a short Custom interval (e.g., 5 s) + Exact mode to capture all code
+- Lecture slides: use Auto + Smart mode
+- Self-testing: generate Flashcards or Quiz mode
+- YouTube: videos under 30 minutes process fastest
+- Best OCR results: lecture recordings with clear slide text rather than whiteboard or handwriting
+
+## General Questions
+You can answer any general question about programming, computer science, databases (DBMS), data structures and algorithms (DSA), artificial intelligence and machine learning, mathematics, studying techniques, or any other topic. Never refuse a general knowledge question — always answer it.
+
+Maintain full conversation history context so follow-up questions make sense. Be helpful, accurate, and concise. Use markdown formatting (lists, bold, code blocks) where it improves readability.`;
 
 router.post("/assistant/chat", async (req, res) => {
   try {
@@ -477,25 +535,48 @@ router.post("/assistant/chat", async (req, res) => {
       notes?: string;
     };
     const msgs = Array.isArray(body.messages) ? body.messages : [];
-    if (msgs.length === 0) { res.status(400).json({ error: "No messages provided" }); return; }
+    if (msgs.length === 0) {
+      res.status(400).json({ error: "No messages provided" });
+      return;
+    }
 
-    const systemWithNotes = body.notes
-      ? `${ASSISTANT_SYSTEM}\n\nUser's generated notes:\n\n${body.notes.slice(0, 6000)}`
+    const systemContent = body.notes
+      ? `${ASSISTANT_SYSTEM}\n\n---\n\n## User's Generated Notes (current session)\n\n${body.notes.slice(0, 8000)}`
       : ASSISTANT_SYSTEM;
 
-    const completion = await openai.chat.completions.create({
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const stream = await openai.chat.completions.create({
       model: "gpt-5.4",
       max_completion_tokens: 8192,
+      stream: true,
       messages: [
-        { role: "system", content: systemWithNotes },
+        { role: "system", content: systemContent },
         ...msgs.map((m) => ({ role: m.role, content: m.content })),
       ],
     });
 
-    res.json({ content: completion.choices[0]?.message?.content ?? "" });
+    for await (const chunk of stream) {
+      const token = chunk.choices[0]?.delta?.content ?? "";
+      if (token) {
+        res.write(`data: ${JSON.stringify({ t: token })}\n\n`);
+      }
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
   } catch (err) {
     req.log.error({ err }, "assistant chat failed");
-    res.status(500).json({ error: "Assistant failed" });
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Assistant failed" });
+    } else {
+      res.write(`data: ${JSON.stringify({ t: "\n\n*Error: could not complete response.*" })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
   }
 });
 
