@@ -1,5 +1,4 @@
 import { Router, type IRouter, type Request, type Response } from "express";
-import { spawn } from "child_process";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { mkdir, rm, readdir, readFile } from "fs/promises";
@@ -312,100 +311,82 @@ async function runYouTubeJob(
   log: Request["log"],
 ) {
   const { url, videoId, requestedInterval, autoInterval, startSec, endSec } = opts;
-  // effectiveInterval is resolved after ffprobe when autoInterval=true
-  let effectiveInterval = requestedInterval > 0 ? requestedInterval : 10; // fallback
-  const videoPath = `${job.tmpDir}/video.mp4`;
+  let effectiveInterval = requestedInterval > 0 ? requestedInterval : 10;
   const framesDir = `${job.tmpDir}/frames`;
 
   try {
     await mkdir(framesDir, { recursive: true });
 
-    // ── Phase 1: Download ────────────────────────────────────────────────────
+    // ── Phase 1: Resolve direct stream URL via yt-dlp android client ─────────
+    // The android client bypasses YouTube's datacenter-IP restrictions.
+    // We only extract the stream URL — no full video download needed.
     job.status = "downloading";
-    pushEvent(job, "status", { step: "downloading", message: "Downloading video from YouTube..." });
+    pushEvent(job, "status", { step: "downloading", message: "Resolving YouTube stream..." });
 
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn("yt-dlp", [
+    let streamUrl: string;
+    try {
+      const { stdout, stderr } = await execFileAsync("yt-dlp", [
         "--no-playlist",
-        "--newline",
         "--no-check-certificate",
-        "--format",
-        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best",
-        "--merge-output-format", "mp4",
-        "--output", videoPath,
+        "--extractor-args", "youtube:player_client=android",
+        "--format", "best[height<=480][ext=mp4]/best[height<=480]/best",
+        "--get-url",
         url,
-      ]);
+      ], { timeout: 30_000 });
 
-      let stderr = "";
-
-      proc.stdout.on("data", (chunk: Buffer) => {
-        const text = chunk.toString();
-        // Parse progress lines: "[download]  45.3% of ~42.32MiB at 1.23MiB/s ETA 00:30"
-        const pctM = text.match(/\[download\]\s+([\d.]+)%/);
-        if (pctM) {
-          const speedM = text.match(/at\s+([\d.]+\s*\S+\/s)/);
-          const etaM = text.match(/ETA\s+(\S+)/);
-          pushEvent(job, "download_progress", {
-            pct: parseFloat(pctM[1]),
-            speed: speedM?.[1],
-            eta: etaM?.[1],
-          });
-        }
-      });
-
-      proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-
-      proc.on("close", (code) => {
-        if (code === 0) { resolve(); return; }
-        reject(new Error(stderr || `yt-dlp exited with code ${code}`));
-      });
-      proc.on("error", (err) => reject(err));
-    }).catch((err: Error) => {
-      const msg = err.message;
+      // stdout may contain warnings on separate lines before the URL
+      const urlLine = stdout.trim().split("\n").find((l) => l.startsWith("http"));
+      if (!urlLine) {
+        throw new Error(stderr?.trim() || "No stream URL returned by yt-dlp");
+      }
+      streamUrl = urlLine;
+      log.info({ jobId, videoId }, "Stream URL resolved");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
       let userMsg: string;
-      let step = "download";
       if (/private video|video is private/i.test(msg)) userMsg = "This video is private.";
       else if (/age.?restrict|confirm your age|sign in/i.test(msg)) userMsg = "This video is age-restricted.";
       else if (/unavailable|not available|removed|banned/i.test(msg)) userMsg = "This video is unavailable or has been removed.";
       else if (/copyright/i.test(msg)) userMsg = "This video is blocked due to copyright.";
-      else userMsg = `Download failed: ${msg.slice(0, 200)}`;
-      pushEvent(job, "error", { step, message: userMsg });
+      else if (/no video formats/i.test(msg)) userMsg = "Could not resolve a playable format. The video may be restricted.";
+      else userMsg = `Could not access video: ${msg.slice(0, 200)}`;
+      pushEvent(job, "error", { step: "download", message: userMsg });
       job.status = "error";
-      throw new Error("__handled__");
-    });
+      return;
+    }
 
-    // ── Phase 2: Get duration via ffprobe — also resolves adaptive interval ──
+    // ── Phase 2: Get duration via ffprobe on the stream URL ───────────────────
     let duration = 0;
     try {
       const { stdout } = await execFileAsync("ffprobe", [
-        "-v", "quiet", "-print_format", "json", "-show_format", videoPath,
-      ], { timeout: 15_000 });
+        "-v", "quiet", "-print_format", "json", "-show_format", streamUrl,
+      ], { timeout: 20_000 });
       const probe = JSON.parse(stdout) as { format?: { duration?: string } };
       duration = parseFloat(probe.format?.duration ?? "0") || 0;
+    } catch { /* non-fatal: duration stays 0 */ }
 
-      // Resolve adaptive interval now that we know the duration
-      if (autoInterval && duration > 0) {
-        effectiveInterval = getAdaptiveInterval(duration);
-        log.info({ jobId, duration, effectiveInterval, autoInterval }, "Adaptive interval resolved");
-        pushEvent(job, "status", {
-          step: "extracting",
-          message: `Using ${effectiveInterval}s interval (auto, ${Math.round(duration / 60)} min video)`,
-        });
-      }
-    } catch { /* non-fatal */ }
+    // Resolve adaptive interval now that we know the duration
+    if (autoInterval && duration > 0) {
+      effectiveInterval = getAdaptiveInterval(duration);
+      log.info({ jobId, duration, effectiveInterval }, "Adaptive interval resolved");
+    }
 
-    // ── Phase 3: Extract frames ───────────────────────────────────────────────
+    // ── Phase 3: Extract frames directly from the stream URL ──────────────────
+    // ffmpeg streams from the CDN URL — no intermediate file download.
     job.status = "extracting";
-    pushEvent(job, "status", { step: "extracting", message: "Extracting frames from video..." });
+    pushEvent(job, "status", {
+      step: "extracting",
+      message: `Extracting frames every ${effectiveInterval}s${autoInterval && duration > 0 ? ` (auto, ${Math.round(duration / 60)} min)` : ""}...`,
+    });
 
-    const actualEnd = endSec != null ? Math.min(endSec, duration || endSec) : duration;
+    const actualEnd = endSec != null ? (duration > 0 ? Math.min(endSec, duration) : endSec) : duration;
     const seekArg = startSec > 0 ? ["-ss", String(startSec)] : [];
     const durArg = actualEnd > startSec ? ["-t", String(actualEnd - startSec)] : [];
 
     const ffmpegArgs = [
       "-loglevel", "warning",
       ...seekArg,
-      "-i", videoPath,
+      "-i", streamUrl,
       ...durArg,
       "-vf", `fps=1/${effectiveInterval},scale='min(960\\,iw)':-2`,
       "-qscale:v", "5",
@@ -413,7 +394,7 @@ async function runYouTubeJob(
       `${framesDir}/frame_%04d.jpg`,
     ];
 
-    await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 120_000 }).catch((err: Error) => {
+    await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 300_000 }).catch((err: Error) => {
       pushEvent(job, "error", { step: "frame_extraction", message: `Frame extraction failed: ${err.message.slice(0, 200)}` });
       job.status = "error";
       throw new Error("__handled__");
