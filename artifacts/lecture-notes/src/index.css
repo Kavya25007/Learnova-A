@@ -223,6 +223,40 @@
   border-radius: 0.75rem;
 }
 
+/* Glass — subtle raised card used throughout the layout */
+.glass {
+  background: hsl(var(--card));
+  border: 1px solid hsl(var(--border));
+  box-shadow: 0 1px 3px hsl(0 0% 0% / 0.04), 0 1px 2px hsl(0 0% 0% / 0.03);
+  transition: box-shadow 0.2s ease;
+}
+
+.glass:hover {
+  box-shadow: 0 2px 8px hsl(0 0% 0% / 0.07), 0 1px 3px hsl(0 0% 0% / 0.05);
+}
+
+/* App background — very subtle dot grid */
+.app-bg {
+  background-color: hsl(var(--background));
+}
+
+/* ── Micro-interaction utilities ───────────────────────────────────────────── */
+
+/* Primary button glow on focus */
+.btn-primary-glow:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px hsl(var(--primary) / 0.25);
+}
+
+/* Subtle card hover lift */
+.card-hover {
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+.card-hover:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px hsl(0 0% 0% / 0.1);
+}
+
 /* ── Success modal ─────────────────────────────────────────────────────────── */
 
 .success-backdrop {

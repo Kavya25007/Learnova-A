@@ -58,18 +58,18 @@ function getAdaptiveInterval(durationSec: number): number {
 const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
 
 const AI_LOADING_MSGS = [
-  "Good notes take a moment...",
-  "Finding important concepts...",
+  "Reading your lecture...",
+  "Understanding concepts...",
+  "Creating structured notes...",
   "Connecting key ideas...",
-  "Structuring your notes...",
-  "Almost there...",
   "Organizing everything for you...",
+  "Finalizing your notes...",
 ];
 
 const PROCESSING_STEPS = [
-  { icon: "🎥", label: "Reading video", min: 0, max: 48 },
-  { icon: "📄", label: "Extracting slides", min: 48, max: 80 },
-  { icon: "🔍", label: "Reading text (OCR)", min: 80, max: 100 },
+  { icon: "🎥", label: "Reading your lecture", min: 0, max: 48 },
+  { icon: "📄", label: "Detecting important slides", min: 48, max: 80 },
+  { icon: "🔍", label: "Extracting text", min: 80, max: 100 },
 ];
 
 const BENEFITS = [
@@ -834,12 +834,26 @@ export default function App() {
 
   const [dragOver, setDragOver] = useState(false);
   const [aiMsgIdx, setAiMsgIdx] = useState(0);
+  const [showSuccessModal, setShowSuccessModal] = useState(false);
+  const prevGeneratingRef = useRef(false);
 
   useEffect(() => {
     if (!generatingNotes) { setAiMsgIdx(0); return; }
     const id = setInterval(() => setAiMsgIdx((i) => (i + 1) % AI_LOADING_MSGS.length), 2500);
     return () => clearInterval(id);
   }, [generatingNotes]);
+
+  // Show success modal when notes generation completes
+  useEffect(() => {
+    if (prevGeneratingRef.current && !generatingNotes && notes) {
+      prevGeneratingRef.current = generatingNotes;
+      setShowSuccessModal(true);
+      const t = setTimeout(() => setShowSuccessModal(false), 2000);
+      return () => clearTimeout(t);
+    }
+    prevGeneratingRef.current = generatingNotes;
+    return undefined;
+  }, [generatingNotes, notes]);
 
   const showHero = !videoFile && !youtubeUrl && frames.length === 0 && !notes;
   const wordCount = notes ? notes.split(/\s+/).filter(Boolean).length : 0;
@@ -1504,6 +1518,49 @@ export default function App() {
       </footer>
 
       <Chat notes={notes} apiBase={apiBase} />
+
+      {/* ── SUCCESS MODAL ──────────────────────────────────────────────────── */}
+      {showSuccessModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center success-backdrop"
+          style={{ background: "hsl(var(--background) / 0.80)", backdropFilter: "blur(6px)" }}
+        >
+          <div className="success-card relative flex flex-col items-center gap-6 px-10 py-10 rounded-3xl bg-card border border-border shadow-2xl max-w-xs mx-4 text-center">
+            {/* Subtle sparkle particles */}
+            <span className="sparkle-1 absolute top-5 left-7 w-2 h-2 rounded-full bg-emerald-400/60" />
+            <span className="sparkle-2 absolute top-4 right-9 w-1.5 h-1.5 rounded-full bg-emerald-300/50" />
+            <span className="sparkle-3 absolute bottom-7 left-5 w-1.5 h-1.5 rounded-full bg-primary/50" />
+            <span className="sparkle-4 absolute bottom-5 right-7 w-2 h-2 rounded-full bg-primary/40" />
+
+            {/* Ring stack + checkmark */}
+            <div className="relative flex items-center justify-center w-24 h-24">
+              {/* Outer expanding ring */}
+              <span
+                className="absolute inset-0 rounded-full border-2 border-emerald-500/40"
+                style={{ animation: "successRingExpand 0.5s cubic-bezier(0.34,1.56,0.64,1) both, successGlow 2s ease-in-out 0.5s infinite" }}
+              />
+              {/* Second softer ring */}
+              <span
+                className="absolute inset-[-8px] rounded-full border border-emerald-400/20"
+                style={{ animation: "successRingExpand 0.55s cubic-bezier(0.34,1.56,0.64,1) 0.08s both" }}
+              />
+              {/* Checkmark circle */}
+              <span
+                className="success-check w-20 h-20 rounded-full bg-emerald-500/10 border border-emerald-500/35 flex items-center justify-center"
+              >
+                <Check className="w-9 h-9 text-emerald-500" strokeWidth={2.5} />
+              </span>
+            </div>
+
+            <div>
+              <p className="text-lg font-semibold leading-tight">Your Notes Are Ready!</p>
+              <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed">
+                Your AI notes have been generated successfully.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
