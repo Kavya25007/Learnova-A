@@ -456,6 +456,9 @@ export default function App() {
     // ── Step 2: Open EventSource and collect frames ──────────────────────────
     const capturedRef: Frame[] = [];
     let totalExpected = 0;
+    // Track whether an error was signalled inside the SSE promise so we don't
+    // read the stale ytErrorMsg closure value after awaiting.
+    let hadError = false;
 
     await new Promise<void>((resolve) => {
       const sse = new EventSource(`${apiBase}/youtube/events/${jobId}`);
@@ -524,6 +527,7 @@ export default function App() {
       sse.addEventListener("error", (e: MessageEvent) => {
         // This fires on both SSE protocol errors AND custom "error" events
         // Check if it has data (custom event) vs network error (no data)
+        hadError = true;
         if (e.data) {
           const d = JSON.parse(e.data) as { step: string; message: string };
           setYtDownloadStatus("error");
@@ -551,8 +555,11 @@ export default function App() {
     if (cancelRef.current || capturedRef.length === 0) {
       if (cancelRef.current) {
         setPhase("Cancelled.");
-      } else if (capturedRef.length === 0 && !ytErrorMsg) {
-        setYtErrorMsg("No frames were received.");
+      } else if (capturedRef.length === 0 && !hadError) {
+        // hadError (not ytErrorMsg) to avoid the stale-closure problem —
+        // React state updates are async, so ytErrorMsg here would still be ""
+        // even if setYtErrorMsg was called inside the SSE promise above.
+        setYtErrorMsg("No frames were received from the server.");
         setPhase("No frames received.");
       }
       setProcessing(false);

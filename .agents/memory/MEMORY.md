@@ -1,0 +1,1 @@
+- [YouTube pipeline bugs](youtube-pipeline-bugs.md) — three bugs crashed/stuck the pipeline; all fixed as of 2026-07-23
