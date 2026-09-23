@@ -1,5 +1,6 @@
 import app from "./app";
 import { logger } from "./lib/logger";
+import { verifyTools } from "./lib/tools";
 
 const rawPort = process.env["PORT"];
 
@@ -22,4 +23,9 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+
+  // Verify external tools asynchronously — does not block startup
+  verifyTools(logger).catch((e) =>
+    logger.error({ err: e }, "Tool verification threw unexpectedly"),
+  );
 });

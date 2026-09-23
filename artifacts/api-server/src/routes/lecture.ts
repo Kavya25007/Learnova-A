@@ -1,5 +1,6 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { execFile, spawn } from "child_process";
+import { getYtDlpPath, getFfmpegPath, getFfprobePath } from "../lib/tools";
 import { promisify } from "util";
 import { mkdir, rm, readdir, readFile, stat } from "fs/promises";
 import { randomUUID } from "crypto";
@@ -332,11 +333,19 @@ async function downloadWithYtDlp(
       `https://www.youtube.com/watch?v=${videoId}`,
     ];
 
-    log.info({ jobId, videoId, client, cmd: `yt-dlp ${ytdlpArgs.join(" ")}` }, "yt-dlp command");
+    let ytdlpBin: string;
+    try {
+      ytdlpBin = await getYtDlpPath();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`yt-dlp is not installed or not on PATH. ${msg}`);
+    }
+
+    log.info({ jobId, videoId, client, cmd: `${ytdlpBin} ${ytdlpArgs.join(" ")}` }, "yt-dlp command");
 
     try {
       const stderrOut = await new Promise<string>((resolve, reject) => {
-        const proc = spawn("yt-dlp", ytdlpArgs);
+        const proc = spawn(ytdlpBin, ytdlpArgs);
         let stderrBuf = "";
         let stdoutBuf = "";
 
@@ -471,8 +480,9 @@ async function runYouTubeJob(
         "-show_streams",
         videoFile,
       ];
-      log.info({ jobId, videoId, cmd: `ffprobe ${ffprobeArgs.join(" ")}` }, "ffprobe command");
-      const { stdout: probeOut } = await execFileAsync("ffprobe", ffprobeArgs, { timeout: 20_000 });
+      const ffprobeBin = await getFfprobePath();
+      log.info({ jobId, videoId, cmd: `${ffprobeBin} ${ffprobeArgs.join(" ")}` }, "ffprobe command");
+      const { stdout: probeOut } = await execFileAsync(ffprobeBin, ffprobeArgs, { timeout: 20_000 });
       const probe = JSON.parse(probeOut) as { format?: { duration?: string; size?: string } };
       duration = parseFloat(probe.format?.duration ?? "0") || 0;
       log.info({ jobId, videoId, duration, formatSize: probe.format?.size }, "ffprobe complete");
@@ -513,10 +523,11 @@ async function runYouTubeJob(
       "-f", "image2",
       `${framesDir}/frame_%04d.jpg`,
     ];
-    log.info({ jobId, videoId, cmd: `ffmpeg ${ffmpegArgs.join(" ")}` }, "ffmpeg command");
+    const ffmpegBin = await getFfmpegPath();
+    log.info({ jobId, videoId, cmd: `${ffmpegBin} ${ffmpegArgs.join(" ")}` }, "ffmpeg command");
 
     try {
-      const { stderr: ffmpegStderr } = await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 300_000 });
+      const { stderr: ffmpegStderr } = await execFileAsync(ffmpegBin, ffmpegArgs, { timeout: 300_000 });
       if (ffmpegStderr.trim()) {
         log.warn({ jobId, videoId, ffmpegStderr: ffmpegStderr.slice(0, 800) }, "ffmpeg stderr (non-fatal)");
       }
