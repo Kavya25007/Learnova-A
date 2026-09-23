@@ -33,3 +33,10 @@ The client name `android_embedded` does not exist in yt-dlp 2025.06.30. yt-dlp s
 YouTube enforces SABR-only streaming for many educational videos from datacenter IPs (e.g. `YTJdBA9wZro`). These are completely inaccessible without a PO token. Format 18 (legacy 360p) is NOT available for many newer/educational videos. The error classification correctly identifies this and suggests downloading + using the Upload tab.
 
 **Why:** PO token generation requires running YouTube's botguard JS; no server-side workaround exists without that.
+
+## Transcript subtitle language selection
+The transcript probe must request a specific supported language such as `en`, not a broad `en.*` pattern. yt-dlp can expand that pattern into translated subtitle variants; one variant may return HTTP 429 and make the entire otherwise-successful caption command exit non-zero.
+
+**Why:** A public video can have a usable English caption file while a translated variant fails, which would incorrectly force the slower video fallback.
+
+**How to apply:** Keep transcript acquisition limited to the language the UI promises, and treat a caption command's exit status as meaningful only after checking the requested caption file when adding more languages.

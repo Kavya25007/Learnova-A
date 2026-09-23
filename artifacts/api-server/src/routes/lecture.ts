@@ -1,10 +1,15 @@
 import { Router, type IRouter, type Request, type Response } from "express";
-import { execFile, spawn } from "child_process";
+import { execFile } from "child_process";
 import { getYtDlpPath, getFfmpegPath, getFfprobePath } from "../lib/tools";
 import { promisify } from "util";
 import { mkdir, rm, readdir, readFile, stat } from "fs/promises";
 import { randomUUID } from "crypto";
 import { openai } from "@workspace/integrations-openai-ai-server";
+import { classifyYouTubeError } from "../youtube/errors";
+import { fetchYouTubeMetadata } from "../youtube/metadata";
+import { runProcess, withBackoff } from "../youtube/subprocess";
+import { extractYouTubeTranscript } from "../youtube/transcript";
+import { parseYouTubeUrl, YouTubeUrlError } from "../youtube/url";
 
 const execFileAsync = promisify(execFile);
 const router: IRouter = Router();
@@ -15,11 +20,12 @@ const router: IRouter = Router();
 // replay the full event log from the start.
 
 interface YtJob {
-  status: "queued" | "downloading" | "extracting" | "done" | "error";
+  status: "queued" | "transcript" | "downloading" | "extracting" | "done" | "error";
   events: string[]; // accumulated SSE event strings (replayed to late connections)
   listeners: Set<(ev: string) => void>;
   tmpDir: string;
   createdAt: number;
+  cleanupTimer?: NodeJS.Timeout;
 }
 
 const jobs = new Map<string, YtJob>();
@@ -39,6 +45,27 @@ function pushEvent(job: YtJob, name: string, data: unknown) {
   const str = `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
   job.events.push(str);
   for (const fn of job.listeners) fn(str);
+}
+
+function scheduleJobCleanup(jobId: string, job: YtJob) {
+  job.cleanupTimer = setTimeout(() => {
+    jobs.delete(jobId);
+  }, 5 * 60 * 1000).unref();
+}
+
+function failJob(
+  jobId: string,
+  job: YtJob,
+  step: string,
+  message: string,
+  log: Request["log"],
+  details?: string,
+) {
+  if (job.status === "error" || job.status === "done") return;
+  job.status = "error";
+  log.error({ jobId, step, message, details }, "YouTube job failed");
+  pushEvent(job, "error", { step, message });
+  scheduleJobCleanup(jobId, job);
 }
 
 // ─── SSE helpers ─────────────────────────────────────────────────────────────
@@ -197,26 +224,25 @@ router.post("/notes/generate", async (req, res) => {
 
 // ─── YouTube metadata ─────────────────────────────────────────────────────────
 router.get("/youtube/meta", async (req, res) => {
-  const url = req.query.url as string;
-  if (!url) { res.status(400).json({ error: "Missing url", step: "url_validation" }); return; }
-
-  const ytRx = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/;
-  const m = url.match(ytRx);
-  if (!m) { res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" }); return; }
-  const videoId = m[1];
-
+  const requestId = req.id;
+  req.log.info({ requestId, url: req.query.url }, "YouTube metadata request started");
   try {
-    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
-    const resp = await fetch(oembedUrl);
-    if (!resp.ok) {
-      res.status(404).json({ error: "Video not found or unavailable", step: "metadata", videoId });
-      return;
-    }
-    const data = (await resp.json()) as { title?: string; author_name?: string; thumbnail_url?: string };
-    res.json({ title: data.title ?? "", channel: data.author_name ?? "", thumbnail: data.thumbnail_url ?? "", videoId });
+    const parsed = parseYouTubeUrl(req.query.url);
+    const data = await fetchYouTubeMetadata(parsed, req.log);
+    req.log.info({ requestId, videoId: parsed.videoId }, "YouTube metadata request completed");
+    res.json(data);
   } catch (err) {
-    req.log.error({ err }, "youtube meta failed");
-    res.status(500).json({ error: "Failed to fetch video metadata", step: "metadata" });
+    const raw = err instanceof Error ? err.message : String(err);
+    const classified = err instanceof YouTubeUrlError
+      ? { code: "invalid_url", message: err.message }
+      : classifyYouTubeError(raw);
+    req.log.error({ requestId, error: raw, code: classified.code }, "YouTube metadata request failed");
+    res.status(err instanceof YouTubeUrlError ? 400 : 502).json({
+      error: classified.message,
+      reason: classified.code,
+      step: err instanceof YouTubeUrlError ? "url_validation" : "metadata",
+      details: raw.slice(0, 500),
+    });
   }
 });
 
@@ -233,12 +259,15 @@ router.post("/youtube/start", async (req: Request, res: Response) => {
     endTime?: number;
   };
 
-  if (!url) { res.status(400).json({ error: "Missing url", step: "url_validation" }); return; }
-
-  const ytRx = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/;
-  const m = url.match(ytRx);
-  if (!m) { res.status(400).json({ error: "Invalid YouTube URL", step: "url_validation" }); return; }
-  const videoId = m[1];
+  let parsedUrl;
+  try {
+    parsedUrl = parseYouTubeUrl(url);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Invalid YouTube URL";
+    res.status(400).json({ error: message, reason: "invalid_url", step: "url_validation" });
+    return;
+  }
+  const { videoId, canonicalUrl } = parsedUrl;
 
   // interval=0 means Auto — the job will compute it from ffprobe duration after download
   const requestedInterval = Number(rawInterval ?? -1);
@@ -263,9 +292,16 @@ router.post("/youtube/start", async (req: Request, res: Response) => {
   res.json({ jobId, videoId });
 
   // Run processing asynchronously — completely detached from the HTTP response
-  runYouTubeJob(jobId, job, { url, videoId, requestedInterval: resolvedInterval, autoInterval, startSec, endSec }, req.log).catch(
-    (err) => req.log.error({ err, jobId }, "Unhandled error in YouTube job"),
-  );
+  runYouTubeJob(
+    jobId,
+    job,
+    { url: canonicalUrl, videoId, requestedInterval: resolvedInterval, autoInterval, startSec, endSec },
+    req.log,
+  ).catch((err) => {
+    const raw = err instanceof Error ? err.message : String(err);
+    const classified = classifyYouTubeError(raw);
+    failJob(jobId, job, "unknown", classified.message, req.log, raw);
+  });
 });
 
 // ─── YouTube SSE event stream ─────────────────────────────────────────────────
@@ -287,8 +323,21 @@ router.get("/youtube/events/:jobId", (req: Request, res: Response) => {
   // Replay all events queued before this connection arrived
   for (const ev of job.events) res.write(ev);
 
+  if (job.status === "done" || job.status === "error") {
+    clearInterval(hb);
+    res.end();
+    return;
+  }
+
   // Register for future events
-  const listener = (ev: string) => { res.write(ev); };
+  const listener = (ev: string) => {
+    res.write(ev);
+    if (ev.startsWith("event: done") || ev.startsWith("event: error")) {
+      clearInterval(hb);
+      job.listeners.delete(listener);
+      res.end();
+    }
+  };
   job.listeners.add(listener);
 
   req.on("close", () => {
@@ -314,12 +363,11 @@ async function downloadWithYtDlp(
   log: Request["log"],
   jobId: string,
 ): Promise<void> {
-  // Try clients in order. android gives format 18 (360p combined mp4) without a PO token.
-  // ios and tv_embedded are tried as fallbacks for videos where android fails.
-  // Note: android_embedded is NOT a valid client in yt-dlp 2025+.
+  // Try supported clients in order. Do not add unofficial clients or scraping
+  // workarounds here: YouTube may require authentication or a PO token.
   const clients = ["android", "ios", "tv_embedded"];
-
   let lastError = "";
+  const ytdlpBin = await getYtDlpPath();
 
   for (const client of clients) {
     const ytdlpArgs = [
@@ -333,93 +381,66 @@ async function downloadWithYtDlp(
       `https://www.youtube.com/watch?v=${videoId}`,
     ];
 
-    let ytdlpBin: string;
-    try {
-      ytdlpBin = await getYtDlpPath();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`yt-dlp is not installed or not on PATH. ${msg}`);
-    }
-
     log.info({ jobId, videoId, client, cmd: `${ytdlpBin} ${ytdlpArgs.join(" ")}` }, "yt-dlp command");
 
     try {
-      const stderrOut = await new Promise<string>((resolve, reject) => {
-        const proc = spawn(ytdlpBin, ytdlpArgs);
-        let stderrBuf = "";
-        let stdoutBuf = "";
+      const stderrOut = await withBackoff(
+        async () => {
+          const output = await runProcess(ytdlpBin, ytdlpArgs, {
+            timeoutMs: 120_000,
+            onStdout: (text) => {
+              for (const line of text.split("\n")) {
+                const progress = line.match(
+                  /\[download\]\s+([\d.]+)%\s+of\s+\S+\s+at\s+(\S+)\s+ETA\s+(\S+)/,
+                );
+                if (progress) {
+                  pushEvent(job, "download_progress", {
+                    pct: parseFloat(progress[1]),
+                    speed: progress[2],
+                    eta: progress[3],
+                  });
+                }
+              }
+            },
+          });
 
-        proc.stdout.on("data", (chunk: Buffer) => {
-          const text = chunk.toString();
-          stdoutBuf += text;
-          // Parse yt-dlp progress lines (printed to stdout with --newline)
-          // e.g. "[download]  15.5% of  128.45MiB at   3.25MiB/s ETA 00:36"
-          for (const line of text.split("\n")) {
-            const m = line.match(/\[download\]\s+([\d.]+)%\s+of\s+\S+\s+at\s+(\S+)\s+ETA\s+(\S+)/);
-            if (m) {
-              pushEvent(job, "download_progress", {
-                pct: parseFloat(m[1]),
-                speed: m[2],
-                eta: m[3],
-              });
-            }
+          if (output.timedOut) {
+            throw new Error(
+              `yt-dlp timed out after 120 seconds.\n${output.stderr}\n${output.stdout}`.trim(),
+            );
           }
-        });
-
-        proc.stderr.on("data", (chunk: Buffer) => { stderrBuf += chunk.toString(); });
-
-        proc.on("error", (err) => reject(new Error(`Failed to spawn yt-dlp: ${err.message}`)));
-        proc.on("close", (code) => {
-          if (code === 0) {
-            resolve(stderrBuf);
-          } else {
-            // Combine stdout + stderr — yt-dlp mixes messages across both streams
-            reject(new Error((stderrBuf + "\n" + stdoutBuf).trim()));
+          if (output.code !== 0) {
+            // Preserve complete stdout + stderr for classification and logs.
+            throw new Error((output.stderr + "\n" + output.stdout).trim());
           }
-        });
-      });
+          return output.stderr;
+        },
+        (error) => {
+          const raw = error instanceof Error ? error.message : String(error);
+          return classifyYouTubeError(raw).retryable;
+        },
+        { attempts: 2, baseDelayMs: 750 },
+      );
 
       // Success — log any non-fatal warnings and return
       if (stderrOut.trim()) {
-        log.warn({ jobId, videoId, client, stderr: stderrOut.slice(0, 800) }, "yt-dlp stderr (non-fatal warnings)");
+        log.warn({ jobId, videoId, client, stderr: stderrOut }, "yt-dlp stderr (non-fatal warnings)");
       }
       log.info({ jobId, videoId, client }, "yt-dlp download succeeded");
       return; // done
 
     } catch (clientErr: unknown) {
       lastError = clientErr instanceof Error ? clientErr.message : String(clientErr);
-      log.warn({ jobId, videoId, client, err: lastError.slice(0, 600) }, "yt-dlp client failed — trying next");
+      const classified = classifyYouTubeError(lastError);
+      log.warn({ jobId, videoId, client, code: classified.code, stderr: lastError }, "yt-dlp client failed");
 
       // Stop early for definitive blocks (no point trying other clients)
-      if (/sign in to confirm|confirm.*not a bot/i.test(lastError)) break;
-      if (/private video|video is private/i.test(lastError)) break;
-      if (/age.?restrict|confirm your age/i.test(lastError)) break;
-      if (/unavailable.*app|not available.*app/i.test(lastError)) {
-        // "not available on this app" = client-specific restriction; try next client
-        continue;
-      }
+      if (!classified.retryable) break;
     }
   }
 
   // All clients exhausted
   throw new Error(lastError || "All yt-dlp clients failed");
-}
-
-// Classify yt-dlp error message into a user-friendly string
-function classifyYtDlpError(msg: string): string {
-  if (/private video|video is private/i.test(msg)) return "This video is private.";
-  if (/confirm.*not a bot|sign in to confirm/i.test(msg))
-    return "YouTube is blocking access from our server. Download the video and use the Upload tab instead.";
-  if (/age.?restrict|confirm your age/i.test(msg)) return "This video is age-restricted and requires sign-in.";
-  if (/sign in/i.test(msg)) return "This video requires sign-in to access. Download it and use the Upload tab.";
-  if (/unavailable|not available|video has been removed|no longer available/i.test(msg))
-    return "This video is unavailable or has been removed.";
-  if (/copyright/i.test(msg)) return "This video is blocked due to copyright.";
-  if (/no video formats found|no suitable format/i.test(msg))
-    return "No playable format found. The video may be restricted or geo-blocked.";
-  if (/geo.?block|not available in your country/i.test(msg))
-    return "This video is geo-blocked and cannot be accessed from our server.";
-  return `Could not download video: ${msg.replace(/\n/g, " ").slice(0, 250)}`;
 }
 
 // ─── Background job runner ────────────────────────────────────────────────────
@@ -438,18 +459,54 @@ async function runYouTubeJob(
     await mkdir(framesDir, { recursive: true });
     log.info({ jobId, videoId, tmpDir: job.tmpDir, videoFile, framesDir }, "Job dirs created");
 
-    // ── Phase 1: Download video with yt-dlp ─────────────────────────────────
+    // ── Phase 1: Prefer public captions before downloading the video ─────────
+    job.status = "transcript";
+    pushEvent(job, "status", { step: "transcript", message: "Checking for available captions..." });
+    log.info({ jobId, videoId }, "Phase 1: checking YouTube transcript availability");
+
+    const transcript = await extractYouTubeTranscript(opts.url, log);
+    if (transcript.status === "available") {
+      job.status = "done";
+      pushEvent(job, "transcript", {
+        segments: transcript.segments,
+        duration: transcript.duration,
+      });
+      pushEvent(job, "done", {
+        frameCount: transcript.segments.length,
+        duration: transcript.duration,
+        source: "transcript",
+      });
+      log.info(
+        { jobId, videoId, segmentCount: transcript.segments.length },
+        "YouTube transcript-first job complete",
+      );
+      scheduleJobCleanup(jobId, job);
+      return;
+    }
+
+    if (transcript.status === "unavailable" && transcript.reason === "blocked" && transcript.raw) {
+      const transcriptFailure = classifyYouTubeError(transcript.raw);
+      if (
+        ["bot_blocked", "private", "age_restricted", "geo_blocked", "tool_missing"].includes(
+          transcriptFailure.code,
+        )
+      ) {
+        failJob(jobId, job, "transcript", transcriptFailure.message, log, transcript.raw);
+        return;
+      }
+    }
+
+    // ── Phase 2: Download video with yt-dlp ─────────────────────────────────
     job.status = "downloading";
     pushEvent(job, "status", { step: "downloading", message: "Downloading video from YouTube..." });
-    log.info({ jobId, videoId }, "Phase 1: starting yt-dlp download");
+    log.info({ jobId, videoId }, "Phase 2: starting yt-dlp download");
 
     try {
       await downloadWithYtDlp(videoId, videoFile, job, log, jobId);
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
-      log.error({ jobId, videoId, stderr: raw }, "yt-dlp download failed — full stderr above");
-      pushEvent(job, "error", { step: "download", message: classifyYtDlpError(raw) });
-      job.status = "error";
+      const classified = classifyYouTubeError(raw);
+      failJob(jobId, job, "download", classified.message, log, raw);
       return;
     }
 
@@ -463,9 +520,14 @@ async function runYouTubeJob(
       if (fileSize === 0) throw new Error("Downloaded file is empty (0 bytes)");
     } catch (statErr: unknown) {
       const msg = statErr instanceof Error ? statErr.message : String(statErr);
-      log.error({ jobId, videoId, videoFile, err: msg }, "File verification failed");
-      pushEvent(job, "error", { step: "download", message: `Download failed: file not created. ${msg}` });
-      job.status = "error";
+      failJob(
+        jobId,
+        job,
+        "download",
+        "The downloaded video file was not created. Please try again.",
+        log,
+        msg,
+      );
       return;
     }
 
@@ -533,12 +595,14 @@ async function runYouTubeJob(
       }
     } catch (ffmpegErr: unknown) {
       const msg = ffmpegErr instanceof Error ? ffmpegErr.message : String(ffmpegErr);
-      log.error({ jobId, videoId, err: msg }, "ffmpeg frame extraction failed — full error above");
-      pushEvent(job, "error", {
-        step: "frame_extraction",
-        message: `Frame extraction failed: ${msg.replace(/\n/g, " ").slice(0, 200)}`,
-      });
-      job.status = "error";
+      failJob(
+        jobId,
+        job,
+        "frame_extraction",
+        "The server could not extract frames from this video. Please try a shorter range.",
+        log,
+        msg,
+      );
       return;
     }
 
@@ -550,12 +614,14 @@ async function runYouTubeJob(
     log.info({ jobId, videoId, frameCount: frameFiles.length }, "Phase 5: streaming frames to clients");
 
     if (frameFiles.length === 0) {
-      log.error({ jobId, videoId, framesDir }, "No frames extracted — ffmpeg produced no output");
-      pushEvent(job, "error", {
-        step: "frame_extraction",
-        message: "No frames could be extracted from the video. Try adjusting the interval or time range.",
-      });
-      job.status = "error";
+      failJob(
+        jobId,
+        job,
+        "frame_extraction",
+        "No frames could be extracted from the video. Try adjusting the interval or time range.",
+        log,
+        `No JPG files in ${framesDir}`,
+      );
       return;
     }
 
@@ -584,13 +650,11 @@ async function runYouTubeJob(
     job.status = "done";
     pushEvent(job, "done", { frameCount: frameFiles.length, duration });
     log.info({ jobId, videoId, frameCount: frameFiles.length }, "YouTube job complete — OCR will run client-side");
+    scheduleJobCleanup(jobId, job);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.error({ err: msg, jobId }, "Unexpected error in YouTube job");
-    if (job.status !== "error") {
-      pushEvent(job, "error", { step: "unknown", message: "An unexpected server error occurred." });
-      job.status = "error";
-    }
+    const classified = classifyYouTubeError(msg);
+    failJob(jobId, job, "unknown", classified.message, log, msg);
   } finally {
     rm(job.tmpDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -619,7 +683,7 @@ Smart Lecture Notes Generator converts lecture or tutorial videos into structure
 2. **Capture Interval**: Choose Auto (adaptive based on video length) or a custom interval in seconds.
 3. **Frame Extraction**:
    - *Local files*: The browser seeks the video at each interval, captures frames to a canvas element, and computes a perceptual hash to skip near-duplicate frames. No data is sent to any server.
-   - *YouTube*: The server uses yt-dlp (android client) to extract a direct CDN stream URL without downloading the full video, then ffmpeg extracts frames from that URL. Frames are sent to the browser as Server-Sent Events (SSE).
+   - *YouTube*: The server first checks for public captions. When captions are available, they are sent as timestamped text segments. Otherwise, the server attempts the normal supported yt-dlp download path and then extracts frames with ffmpeg. Frames are sent to the browser as Server-Sent Events (SSE).
 4. **OCR**: Tesseract.js runs in the browser using 3 parallel web workers to extract text from each unique frame.
 5. **Note Generation**: All OCR text is sent to the backend, which uses OpenAI GPT to produce structured markdown notes in the chosen mode.
 
@@ -638,8 +702,9 @@ Smart Lecture Notes Generator converts lecture or tutorial videos into structure
 - **Quiz**: Multiple-choice questions generated from the video content.
 
 ## YouTube Processing Details
-- yt-dlp extracts a direct playback URL using the android player client (bypasses datacenter IP restrictions that block standard downloads).
-- ffmpeg streams frames directly from the CDN URL — the full video is never stored on the server.
+- Public captions are preferred because they provide timestamped text without video download or OCR.
+- If captions are unavailable, yt-dlp tries a small set of supported YouTube player clients. This is not a restriction bypass; YouTube may require authentication or a PO token, and those failures are surfaced honestly.
+- When a download succeeds, ffmpeg extracts temporary frames and the temporary files are removed after processing.
 - Frames are delivered to the browser in real time via SSE.
 - Only public, non-age-restricted, non-geo-blocked videos are supported.
 

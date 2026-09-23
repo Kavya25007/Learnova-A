@@ -43,6 +43,7 @@ type Frame = {
   text: string;
   ocrProgress: number;
   ocrDone: boolean;
+  source?: "video" | "transcript";
 };
 
 // 0 = Auto (adaptive). Positive number = Custom seconds.
@@ -223,6 +224,7 @@ export default function App() {
   const [ytVideoError, setYtVideoError] = useState<string>("");
   const [ytDownloadPct, setYtDownloadPct] = useState<number>(0);
   const [ytTotalFrames, setYtTotalFrames] = useState<number>(0);
+  const [ytSource, setYtSource] = useState<"video" | "transcript" | null>(null);
   const sseRef = useRef<EventSource | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [interval, setIntervalVal] = useState<number>(AUTO_INTERVAL);
@@ -353,6 +355,7 @@ export default function App() {
     setYtVideoError("");
     setYtDownloadPct(0);
     setYtTotalFrames(0);
+    setYtSource(null);
     // close any live SSE connection
     if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
   }
@@ -471,6 +474,10 @@ export default function App() {
           setYtDownloadStatus("downloading");
           setPhase("Downloading video from YouTube...");
           setProgress(10);
+        } else if (d.step === "transcript") {
+          setYtDownloadStatus("downloading");
+          setPhase("Checking for public captions...");
+          setProgress(8);
         } else if (d.step === "extracting") {
           setYtDownloadStatus("done");
           setYtExtractStatus("extracting");
@@ -499,9 +506,41 @@ export default function App() {
         setProgress(50);
       });
 
+      sse.addEventListener("transcript", (e: MessageEvent) => {
+        if (cancelRef.current) { sse.close(); resolve(); return; }
+        const d = JSON.parse(e.data) as {
+          segments: { start: number; text: string }[];
+          duration: number;
+        };
+        const transcriptFrames: Frame[] = d.segments
+          .filter((segment) => segment.text.trim())
+          .map((segment, index) => ({
+            id: `transcript-${index}-${segment.start.toFixed(2)}`,
+            timestamp: segment.start,
+            thumb: ytMeta?.thumbnail || "",
+            hash: "",
+            text: segment.text.trim(),
+            ocrProgress: 1,
+            ocrDone: true,
+            source: "transcript",
+          }));
+        capturedRef.push(...transcriptFrames);
+        totalExpected = transcriptFrames.length;
+        setYtSource("transcript");
+        setYtDownloadStatus("done");
+        setYtExtractStatus("done");
+        setYtTotalFrames(transcriptFrames.length);
+        setYtDuration(d.duration);
+        setStatFrames(transcriptFrames.length);
+        setStatOcr(transcriptFrames.length);
+        setProgress(100);
+        setPhase(`Public captions received (${transcriptFrames.length} segments).`);
+      });
+
       sse.addEventListener("frame", (e: MessageEvent) => {
         if (cancelRef.current) { sse.close(); resolve(); return; }
         const d = JSON.parse(e.data) as { index: number; timestamp: number; data: string };
+        setYtSource("video");
         const frame: Frame = {
           id: `yt-${d.timestamp.toFixed(2)}`,
           timestamp: d.timestamp,
@@ -510,6 +549,7 @@ export default function App() {
           text: "",
           ocrProgress: 0,
           ocrDone: false,
+          source: "video",
         };
         capturedRef.push(frame);
         setStatFrames(capturedRef.length);
@@ -519,6 +559,13 @@ export default function App() {
       });
 
       sse.addEventListener("done", () => {
+        if (capturedRef.length > 0 && capturedRef[0]?.source === "transcript") {
+          setFrames([...capturedRef]);
+          setStatFrames(capturedRef.length);
+          setStatOcr(capturedRef.length);
+          setPhase(`Done. Used public captions from YouTube (${capturedRef.length} segments).`);
+          setProgress(100);
+        }
         sse.close();
         sseRef.current = null;
         resolve();
@@ -550,6 +597,17 @@ export default function App() {
         resolve();
       });
     });
+
+    // Transcript chunks are already text; skip browser OCR and use them directly.
+    if (capturedRef.length > 0 && capturedRef[0]?.source === "transcript") {
+      setFrames([...capturedRef]);
+      setStatFrames(capturedRef.length);
+      setStatOcr(capturedRef.length);
+      setProcessing(false);
+      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
+      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
+      return;
+    }
 
     // ── Step 3: Run OCR on all collected frames ───────────────────────────────
     if (cancelRef.current || capturedRef.length === 0) {
@@ -1337,9 +1395,9 @@ export default function App() {
             <div className="glass rounded-2xl p-4 sm:p-5">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="font-semibold">
-                  Captured frames{" "}
+                  {ytSource === "transcript" ? "Public captions" : "Captured frames"}{" "}
                   <span className="text-xs text-muted-foreground font-normal">
-                    ({frames.length} unique · {totalText.toLocaleString()} chars OCR)
+                    ({frames.length} {ytSource === "transcript" ? "caption segments" : "unique"} · {totalText.toLocaleString()} chars {ytSource === "transcript" ? "transcript" : "OCR"})
                   </span>
                 </h2>
               </div>
@@ -1347,7 +1405,14 @@ export default function App() {
                 {frames.map((f) => (
                   <div key={f.id} className="rounded-xl border border-border bg-card overflow-hidden hover:border-primary/30 hover:shadow-sm transition-all group">
                     <div className="relative aspect-video bg-black">
-                      <img src={f.thumb} className="w-full h-full object-contain group-hover:opacity-90 transition-opacity" alt={`Frame at ${fmtTime(f.timestamp)}`} />
+                      {f.source === "transcript" ? (
+                        <div className="w-full h-full grid place-items-center bg-primary/10 text-primary">
+                          <FileText className="w-8 h-8" />
+                          <span className="sr-only">Public caption segment</span>
+                        </div>
+                      ) : (
+                        <img src={f.thumb} className="w-full h-full object-contain group-hover:opacity-90 transition-opacity" alt={`Frame at ${fmtTime(f.timestamp)}`} />
+                      )}
                       <span className="absolute bottom-1 right-1 text-[10px] px-1.5 py-0.5 rounded bg-black/70 text-white">{fmtTime(f.timestamp)}</span>
                     </div>
                     <div className="p-2">
