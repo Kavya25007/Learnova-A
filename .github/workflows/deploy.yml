@@ -41,8 +41,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      
       - name: Build frontend
-        run: pnpm --dir artifacts/lecture-notes run build -- --base=/Learnova-A/
+        working-directory: artifacts/lecture-notes
+        env:
+          PORT: "3000"
+          BASE_PATH: /Learnova-A/
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+        run: pnpm exec vite build --config vite.config.ts
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
