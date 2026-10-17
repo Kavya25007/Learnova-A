@@ -19,7 +19,14 @@ function requireOpenAI(): OpenAI {
     // Mode 2: Standard OpenAI API key
     const openaiApiKey = process.env["OPENAI_API_KEY"];
 
-    if (replitBaseURL && replitApiKey) {
+    const geminiApiKey = process.env["GEMINI_API_KEY"];
+    
+    if (geminiApiKey) {
+      _client = new OpenAI({
+        apiKey: geminiApiKey,
+        baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      });
+    } else if (replitBaseURL && replitApiKey) {
       // Replit managed AI proxy
       _client = new OpenAI({ apiKey: replitApiKey, baseURL: replitBaseURL });
     } else if (openaiApiKey) {
