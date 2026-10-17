@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Chat } from "./components/Chat";
+import { InteractiveQuiz } from "./components/InteractiveQuiz";
+import { exportPdf, previewPdf } from "./lib/pdfExporter";
 import Tesseract from "tesseract.js";
 import { Document, Paragraph, TextRun, HeadingLevel, Packer } from "docx";
 import {
@@ -56,6 +58,13 @@ function getAdaptiveInterval(durationSec: number): number {
   if (durationSec <= 3600) return 15;  // 30–60 min → 15 s
   return 20;                           // 60+ min   → 20 s
 }
+
+function getSuccessMessage(m: Mode): string {
+  if (m === "quiz") return "Quiz is ready!";
+  if (m === "flashcards") return "Flashcards are ready!";
+  return "Notes are ready!";
+}
+
 const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
 
 const AI_LOADING_MSGS = [
@@ -136,10 +145,13 @@ function downloadFile(name: string, content: string, type = "text/markdown") {
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
+  a.rel = "noopener";
   document.body.appendChild(a);
   a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  setTimeout(() => {
+    if (a.parentNode) a.parentNode.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 30000);
 }
 
 function downloadBlob(name: string, blob: Blob) {
@@ -147,10 +159,60 @@ function downloadBlob(name: string, blob: Blob) {
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
+  a.rel = "noopener";
   document.body.appendChild(a);
   a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  setTimeout(() => {
+    if (a.parentNode) a.parentNode.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 30000);
+}
+
+function getExportFileName(
+  userTitle: string,
+  ytTitle: string | undefined,
+  notesContent: string,
+  currentMode: Mode,
+  ext: string,
+): string {
+  let rawTitle = userTitle.trim();
+  if (!rawTitle && ytTitle) {
+    rawTitle = ytTitle.trim();
+  }
+  if (!rawTitle && notesContent) {
+    const match = notesContent.match(/^#\s+([^\n\r]+)/m);
+    if (match) {
+      rawTitle = match[1].split("—")[0].split("-")[0].trim();
+    }
+  }
+  if (!rawTitle) {
+    rawTitle = "Lecture";
+  }
+
+  // Clean title for valid filesystem filenames across Windows, macOS, and Linux
+  let clean = rawTitle
+    .replace(/[/\\?%*:|"<>]/g, "")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-");
+
+  if (!clean) clean = "Lecture";
+
+  // Append feature-specific suffix (Notes, Quiz, Flashcards)
+  let suffix = "Notes";
+  if (currentMode === "quiz") {
+    suffix = "Quiz";
+  } else if (currentMode === "flashcards") {
+    suffix = "Flashcards";
+  }
+
+  if (clean.toLowerCase().endsWith(suffix.toLowerCase())) {
+    clean = clean.slice(0, -suffix.length).replace(/-+$/, "");
+  }
+
+  const base = clean ? `${clean}-${suffix}` : suffix;
+  const cleanExt = ext.startsWith(".") ? ext : `.${ext}`;
+  return `${base}${cleanExt}`;
 }
 
 async function exportDocx(notes: string, slug: string) {
@@ -244,8 +306,16 @@ export default function App() {
   const [customInputStr, setCustomInputStr] = useState<string>("10");
 
   const [notes, setNotes] = useState<string>("");
+  const [generatedMode, setGeneratedMode] = useState<Mode>("smart");
+  const [noteQuality, setNoteQuality] = useState<{
+    score: number;
+    isValid: boolean;
+    generatedByAi: boolean;
+    warnings: string[];
+  } | null>(null);
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [quizViewMode, setQuizViewMode] = useState<"interactive" | "markdown">("interactive");
 
   const [darkMode, setDarkMode] = useState(() =>
     document.documentElement.classList.contains("dark"),
@@ -333,6 +403,9 @@ export default function App() {
         }
         const d = await r.json() as YtMeta;
         setYtMeta(d);
+        if (!title && d.title) {
+          setTitle(d.title);
+        }
       })
       .catch((e: Error) => setYtMetaError(`Network error: ${e.message}`))
       .finally(() => setYtMetaLoading(false));
@@ -343,6 +416,8 @@ export default function App() {
     cancelRef.current = false;
     setFrames([]);
     setNotes("");
+    setNoteQuality(null);
+    setGeneratedMode("smart");
     setProgress(0);
     setPhase("");
     setStatFrames(0);
@@ -870,13 +945,16 @@ export default function App() {
     cancelRef.current = true;
   }
 
-  async function generateNotes() {
+  async function generateNotes(targetMode?: Mode) {
     if (frames.length === 0) return;
+    const effectiveMode = targetMode || mode;
+    if (targetMode) setMode(targetMode);
     setGeneratingNotes(true);
     setNotes("");
+    setNoteQuality(null);
     try {
       const payload = {
-        mode,
+        mode: effectiveMode,
         title,
         frames: frames.map((f) => ({ timestamp: f.timestamp, text: f.text })),
       };
@@ -888,6 +966,10 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setNotes(data.notes || "");
+      setGeneratedMode(data.mode || effectiveMode);
+      if (data.quality) {
+        setNoteQuality(data.quality);
+      }
     } catch (e) {
       setNotes(
         `> Failed to generate notes. Please try again.\n\n\`${(e as Error).message}\``,
@@ -1179,8 +1261,25 @@ export default function App() {
                       <div className="flex justify-between"><span className="text-muted-foreground">Duration</span><span>{formatTime(ytDuration)}</span></div>
                     )}
                     {ytErrorMsg && (
-                      <div className="mt-1 pt-1 border-t border-border">
-                        <p className="text-destructive break-words"><span className="font-semibold">Error ({ytErrorStep}):</span> {ytErrorMsg}</p>
+                      <div className="mt-2 p-3.5 rounded-xl border border-destructive/30 bg-destructive/8 space-y-2 text-left">
+                        <p className="text-xs font-semibold text-destructive break-words flex items-center gap-1.5">
+                          ⚠️ {ytErrorMsg}
+                        </p>
+                        <p className="text-[11px] text-muted-foreground leading-relaxed">
+                          YouTube is blocking automated requests from this IP. You can download the video file (or use any local MP4/WebM lecture) and process it instantly with 100% privacy.
+                        </p>
+                        <div className="pt-1 flex flex-wrap gap-2">
+                          <button
+                            onClick={() => {
+                              setYoutubeUrl("");
+                              const input = document.querySelector<HTMLInputElement>("input[type='file']");
+                              if (input) input.click();
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 shadow-sm transition"
+                          >
+                            📁 Upload Local Video File
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1314,7 +1413,7 @@ export default function App() {
                   <X className="w-4 h-4" /> Cancel
                 </button>
               )}
-              <button onClick={generateNotes} disabled={frames.length === 0 || generatingNotes || processing}
+              <button onClick={() => generateNotes()} disabled={frames.length === 0 || generatingNotes || processing}
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-foreground text-background font-medium shadow hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-all hover:shadow-md"
               >
                 {generatingNotes ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
@@ -1441,15 +1540,15 @@ export default function App() {
                   <Check className="w-4 h-4" />
                 </div>
                 <div>
-                  <p className="font-semibold text-sm text-emerald-700 dark:text-emerald-400">Your notes are ready!</p>
+                  <p className="font-semibold text-sm text-emerald-700 dark:text-emerald-400">{getSuccessMessage(generatedMode)}</p>
                   <p className="text-[11px] text-muted-foreground">What would you like to do next?</p>
                 </div>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 {[
-                  { label: "📚 Study Notes", onClick: () => {}, active: true },
-                  { label: "📝 Quiz", onClick: () => { setMode("quiz"); setTimeout(generateNotes, 50); } },
-                  { label: "🧠 Flashcards", onClick: () => { setMode("flashcards"); setTimeout(generateNotes, 50); } },
+                  { label: "📚 Study Notes", onClick: () => generateNotes("smart"), active: generatedMode !== "quiz" && generatedMode !== "flashcards" },
+                  { label: "📝 Quiz", onClick: () => generateNotes("quiz"), active: generatedMode === "quiz" },
+                  { label: "🧠 Flashcards", onClick: () => generateNotes("flashcards"), active: generatedMode === "flashcards" },
                   { label: "📥 Export", onClick: () => setExportOpen((v) => !v) },
                 ].map(({ label, onClick, active }) => (
                   <button key={label} onClick={onClick}
@@ -1487,11 +1586,12 @@ export default function App() {
                     {exportOpen && (
                       <div className="absolute right-0 mt-1 w-40 bg-card border border-border rounded-xl shadow-lg z-20 py-1 overflow-hidden" onMouseLeave={() => setExportOpen(false)}>
                         {[
-                          { label: "Markdown (.md)", action: () => downloadFile(`${(title || "notes").replace(/\s+/g, "-")}.md`, notes) },
-                          { label: "Plain text (.txt)", action: () => exportTxt(notes, (title || "notes").replace(/\s+/g, "-")) },
-                          { label: "Word (.docx)", action: () => exportDocx(notes, (title || "notes").replace(/\s+/g, "-")) },
-                          { label: "PDF (print)", action: () => window.print() },
-                          { label: "Anki flashcards", action: () => exportAnki(notes, (title || "notes").replace(/\s+/g, "-")) },
+                          { label: "Markdown (.md)", action: () => downloadFile(getExportFileName(title, ytMeta?.title, notes, generatedMode, ".md"), notes) },
+                          { label: "Plain text (.txt)", action: () => exportTxt(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".txt").replace(/\.txt$/, "")) },
+                          { label: "Word (.docx)", action: () => exportDocx(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".docx").replace(/\.docx$/, "")) },
+                          { label: "PDF (.pdf)", action: () => exportPdf(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".pdf"), title || ytMeta?.title, generatedMode) },
+                          { label: "Preview PDF", action: () => previewPdf(notes, title || ytMeta?.title) },
+                          { label: "Anki flashcards", action: () => exportAnki(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".tsv").replace(/\.tsv$/, "")) },
                         ].map(({ label, action }) => (
                           <button key={label} onClick={() => { action(); setExportOpen(false); }} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-secondary transition">{label}</button>
                         ))}
@@ -1502,14 +1602,63 @@ export default function App() {
               )}
             </div>
 
-            {/* Reading metadata bar */}
+            {/* Reading metadata bar & Quiz View Toggle */}
             {notes && !generatingNotes && (
-              <div className="flex items-center gap-3 mb-3 pb-3 border-b border-border text-[11px] text-muted-foreground">
-                <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> ~{readingTime} min read</span>
-                <span className="text-border">·</span>
-                <span>{wordCount.toLocaleString()} words</span>
-                <span className="text-border">·</span>
-                <span className="capitalize">{mode} mode</span>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-3 pb-3 border-b border-border text-[11px] text-muted-foreground">
+                <div className="flex items-center gap-2">
+                  <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> ~{readingTime} min read</span>
+                  <span className="text-border">·</span>
+                  <span>{wordCount.toLocaleString()} words</span>
+                  <span className="text-border">·</span>
+                  <span className="capitalize">{mode} mode</span>
+                  {noteQuality && (
+                    <>
+                      <span className="text-border">·</span>
+                      <span
+                        className={classNames(
+                          "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold",
+                          noteQuality.isValid
+                            ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                            : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+                        )}
+                        title={
+                          noteQuality.isValid
+                            ? `Validated: score ${noteQuality.score}/100, no corrupted or repetitive sections`
+                            : `Quality warnings: ${noteQuality.warnings.join(", ")}`
+                        }
+                      >
+                        ✓ Quality {noteQuality.score}%
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                {mode === "quiz" && (
+                  <div className="flex items-center gap-1 p-0.5 rounded-lg bg-secondary border border-border">
+                    <button
+                      onClick={() => setQuizViewMode("interactive")}
+                      className={classNames(
+                        "px-2.5 py-1 rounded-md font-semibold transition text-[11px]",
+                        quizViewMode === "interactive"
+                          ? "bg-primary text-primary-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      )}
+                    >
+                      Interactive Quiz
+                    </button>
+                    <button
+                      onClick={() => setQuizViewMode("markdown")}
+                      className={classNames(
+                        "px-2.5 py-1 rounded-md font-semibold transition text-[11px]",
+                        quizViewMode === "markdown"
+                          ? "bg-primary text-primary-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      )}
+                    >
+                      Full Text
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1564,9 +1713,13 @@ export default function App() {
 
               {/* Notes content */}
               {!generatingNotes && notes && (
-                <div key={notes.length} className="prose-notes text-sm notes-fade-in">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
-                </div>
+                mode === "quiz" && quizViewMode === "interactive" ? (
+                  <InteractiveQuiz quizMarkdown={notes} title={title || ytMeta?.title || "Practice Quiz"} />
+                ) : (
+                  <div key={notes.length} className="prose-notes text-sm notes-fade-in">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
+                  </div>
+                )
               )}
             </div>
           </div>
@@ -1625,9 +1778,13 @@ export default function App() {
             </div>
 
             <div>
-              <p className="text-lg font-semibold leading-tight">Your Notes Are Ready!</p>
+              <p className="text-lg font-semibold leading-tight">{getSuccessMessage(generatedMode)}</p>
               <p className="text-sm text-muted-foreground mt-1.5 leading-relaxed">
-                Your AI notes have been generated successfully.
+                {generatedMode === "quiz"
+                  ? "Your AI quiz has been generated successfully."
+                  : generatedMode === "flashcards"
+                  ? "Your AI flashcards have been generated successfully."
+                  : "Your AI notes have been generated successfully."}
               </p>
             </div>
           </div>

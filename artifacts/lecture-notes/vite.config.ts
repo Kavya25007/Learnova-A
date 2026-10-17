@@ -26,6 +26,11 @@ if (!basePath) {
   );
 }
 
+// The API server port/URL — in development the Vite proxy forwards /api to this target.
+// On Replit, both services share the same reverse proxy so no separate proxy is needed.
+// Locally, the API server runs on its own port (default 8080).
+const apiProxyTarget = process.env.API_PROXY_TARGET ?? "http://localhost:8080";
+
 export default defineConfig({
   base: basePath,
   plugins: [
@@ -66,6 +71,18 @@ export default defineConfig({
     fs: {
       strict: true,
     },
+    // Proxy /api requests to the API server in local development.
+    // On Replit the reverse proxy handles this at the platform level.
+    proxy: process.env.REPL_ID
+      ? undefined
+      : {
+          "/api": {
+            target: apiProxyTarget,
+            changeOrigin: true,
+            // SSE streams need these options to pass through correctly
+            ws: false,
+          },
+        },
   },
   preview: {
     port,

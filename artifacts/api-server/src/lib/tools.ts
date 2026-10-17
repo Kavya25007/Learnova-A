@@ -1,89 +1,132 @@
 /**
  * Binary resolver and startup health checks for external tools.
  *
- * yt-dlp is declared in replit.nix but may not be on PATH in an imported
- * project until the nix environment is rebuilt. This module resolves the
- * correct binary path at runtime by:
- *   1. Trying `which <tool>` (works once PATH is up to date)
- *   2. Globbing the nix store for the newest matching binary (reliable fallback)
+ * Resolves the correct binary path at runtime by:
+ *   1. Trying `where` (Windows) or `which` (Unix/macOS) — works when the tool is on PATH
+ *   2. Trying common Windows installation paths for yt-dlp as a fallback
  *
- * Resolved paths are cached so the glob only runs once per process.
+ * Resolved paths are cached so the lookup only runs once per process.
  */
 
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { readdir } from "fs/promises";
+import { access } from "fs/promises";
+import { constants as fsConstants } from "fs";
+import os from "os";
 
 const execFileAsync = promisify(execFile);
-
-// ─── Nix store fallback paths ─────────────────────────────────────────────────
-// These directories contain versioned yt-dlp builds. We sort by version string
-// and pick the newest one.
-const YT_DLP_NIX_GLOB_DIR = "/nix/store";
 
 // Cache resolved paths across calls
 const _resolved = new Map<string, string>();
 
+/** Return the OS-appropriate "which" command name. */
+function whichCommand(): string {
+  return process.platform === "win32" ? "where" : "which";
+}
+
+/**
+ * Common fallback paths to try on Windows when the tool is not on PATH.
+ * These cover the most common pip/pipx/scoop/winget install locations.
+ */
+function getWindowsFallbackPaths(name: string): string[] {
+  const home = os.homedir();
+  const appData = process.env["APPDATA"] ?? `${home}\\AppData\\Roaming`;
+  const localAppData = process.env["LOCALAPPDATA"] ?? `${home}\\AppData\\Local`;
+
+  if (name === "yt-dlp") {
+    return [
+      // pip / pip3 install location (Python Scripts)
+      `${localAppData}\\Programs\\Python\\Python314\\Scripts\\yt-dlp.exe`,
+      `${localAppData}\\Programs\\Python\\Python313\\Scripts\\yt-dlp.exe`,
+      `${localAppData}\\Programs\\Python\\Python312\\Scripts\\yt-dlp.exe`,
+      `${localAppData}\\Programs\\Python\\Python311\\Scripts\\yt-dlp.exe`,
+      `${localAppData}\\Programs\\Python\\Python310\\Scripts\\yt-dlp.exe`,
+      `${home}\\AppData\\Local\\Programs\\Python\\Python314\\Scripts\\yt-dlp.exe`,
+      // pipx
+      `${localAppData}\\pipx\\venvs\\yt-dlp\\Scripts\\yt-dlp.exe`,
+      `${home}\\.local\\bin\\yt-dlp.exe`,
+      // scoop
+      `${home}\\scoop\\shims\\yt-dlp.exe`,
+      // winget / manual
+      `C:\\yt-dlp\\yt-dlp.exe`,
+      `C:\\tools\\yt-dlp\\yt-dlp.exe`,
+      // Roaming scripts
+      `${appData}\\Python\\Scripts\\yt-dlp.exe`,
+    ];
+  }
+
+  if (name === "ffmpeg" || name === "ffprobe") {
+    const exe = `${name}.exe`;
+    return [
+      `C:\\ffmpeg\\ffmpeg\\bin\\${exe}`,
+      `C:\\ffmpeg\\bin\\${exe}`,
+      `C:\\Program Files\\ffmpeg\\bin\\${exe}`,
+      `C:\\Program Files (x86)\\ffmpeg\\bin\\${exe}`,
+      `${home}\\scoop\\apps\\ffmpeg\\current\\bin\\${exe}`,
+      `C:\\tools\\ffmpeg\\bin\\${exe}`,
+    ];
+  }
+
+  return [];
+}
+
 /**
  * Resolve a binary to its absolute path.
- * Tries `which` first, then scans the nix store as fallback.
+ * Tries `where`/`which` first, then platform-specific fallback paths.
  */
 export async function resolveBinary(name: string): Promise<string> {
   const cached = _resolved.get(name);
   if (cached) return cached;
 
-  // 1. Try which — works when the nix env is fully active
+  // 1. Try where/which — works when the tool is on PATH
   try {
-    const { stdout } = await execFileAsync("which", [name], { timeout: 5_000 });
-    const p = stdout.trim();
+    const whichCmd = whichCommand();
+    const { stdout } = await execFileAsync(whichCmd, [name], { timeout: 5_000 });
+    // `where` on Windows returns multiple lines; take the first non-empty one
+    const p = stdout.trim().split(/\r?\n/)[0]?.trim();
     if (p) {
       _resolved.set(name, p);
       return p;
     }
   } catch {
-    // not on PATH — fall through to nix store scan
+    // not on PATH — fall through to fallback paths
   }
 
-  // 2. Scan the nix store for yt-dlp builds, sorted newest-version-first, and
-  //    call each candidate directly via execFileAsync (no shell involved).
-  //    Shell globs on /nix/store don't work from inside Node.js workflow
-  //    processes on Replit due to filesystem namespace differences, but direct
-  //    execFileAsync calls on absolute nix store paths work fine.
-  if (name === "yt-dlp") {
+  // 2. Try common installation paths (platform-specific)
+  const fallbacks = getWindowsFallbackPaths(name);
+  for (const candidate of fallbacks) {
     try {
-      const storeEntries = await readdir(YT_DLP_NIX_GLOB_DIR);
-      const ytdlpEntries = storeEntries.filter((e) => e.includes("yt-dlp") && !e.includes("-dist"));
-
-      // Extract YYYY.MM.DD version from the entry name for sorting
-      function extractVersion(entry: string): string {
-        const m = entry.match(/yt-dlp-(\d{4}\.\d+\.\d+)/);
-        return m ? m[1] : "0000.00.00";
-      }
-
-      // Sort newest-first
-      ytdlpEntries.sort((a, b) => extractVersion(b).localeCompare(extractVersion(a)));
-
-      for (const entry of ytdlpEntries) {
-        const bin = `${YT_DLP_NIX_GLOB_DIR}/${entry}/bin/yt-dlp`;
-        try {
-          const { stdout: ver } = await execFileAsync(bin, ["--version"], { timeout: 5_000 });
-          _resolved.set(name, bin);
-          process.stderr.write(`[tools] yt-dlp resolved: ${bin} (${ver.trim()})\n`);
-          return bin;
-        } catch {
-          continue;
-        }
-      }
+      await access(candidate, fsConstants.X_OK);
+      // Also verify it actually runs
+      const versionFlag = name === "ffmpeg" || name === "ffprobe" ? "-version" : "--version";
+      await execFileAsync(candidate, [versionFlag], { timeout: 5_000 });
+      _resolved.set(name, candidate);
+      process.stderr.write(`[tools] ${name} resolved via fallback: ${candidate}\n`);
+      return candidate;
     } catch {
-      // nix store not readable — fall through
+      continue;
     }
   }
 
+  // 3. Last resort: maybe it's available as just the name (trust the OS)
+  //    Try calling it directly — if it works, use it
+  try {
+    const versionFlag = name === "ffmpeg" || name === "ffprobe" ? "-version" : "--version";
+    await execFileAsync(name, [versionFlag], { timeout: 5_000 });
+    _resolved.set(name, name);
+    return name;
+  } catch {
+    // genuinely not found
+  }
+
+  const installGuide = name === "yt-dlp"
+    ? `Run: pip install yt-dlp  (or visit https://github.com/yt-dlp/yt-dlp#installation)`
+    : `Download from https://ffmpeg.org/download.html and add to PATH`;
+
   throw new Error(
-    `Binary "${name}" not found. ` +
-    `It is declared in replit.nix but not on PATH. ` +
-    `Try reloading the Replit environment (Shell → restart) or running ` +
-    `"nix-env -i ${name}" in the shell.`,
+    `Binary "${name}" not found on PATH or common installation locations.\n` +
+    `${installGuide}\n` +
+    `After installing, restart the server.`,
   );
 }
 

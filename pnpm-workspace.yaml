@@ -4,6 +4,11 @@ packages:
   - lib/integrations/*
   - scripts
 
+allowBuilds:
+  core-js: set this to true or false
+  esbuild: true
+  tesseract.js: true
+
 autoInstallPeers: false
 
 catalog:

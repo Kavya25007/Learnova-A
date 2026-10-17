@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bash -c 'YTDLP=$(ls /nix/store/*-yt-dlp-2025*/bin/yt-dlp /nix/store/*-yt-dlp-2024*/bin/yt-dlp 2>/dev/null | sort -rV | head -1); [ -n \"$YTDLP\" ] && ln -sf \"$YTDLP\" /tmp/replit-yt-dlp && echo \"[setup] yt-dlp symlink: /tmp/replit-yt-dlp -> $YTDLP\" || echo \"[setup] yt-dlp not found in nix store, will fall back to PATH\"' && export NODE_ENV=development && pnpm run build && pnpm run start",
+    "dev": "pnpm run build && pnpm run start",
     "build": "node ./build.mjs",
-    "start": "node --enable-source-maps ./dist/index.mjs",
+    "start": "node --env-file=.env --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -17,6 +17,7 @@
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
+    "jspdf": "^4.2.1",
     "pino": "^9",
     "pino-http": "^10",
     "youtubei.js": "^17.2.0"

@@ -3,7 +3,10 @@ import { execFile } from "child_process";
 import { getYtDlpPath, getFfmpegPath, getFfprobePath } from "../lib/tools";
 import { promisify } from "util";
 import { mkdir, rm, readdir, readFile, stat } from "fs/promises";
+import { writeFileSync, existsSync } from "fs";
 import { randomUUID } from "crypto";
+import { join as pathJoin } from "path";
+import os from "os";
 import { openai } from "@workspace/integrations-openai-ai-server";
 import { classifyYouTubeError } from "../youtube/errors";
 import { fetchYouTubeMetadata } from "../youtube/metadata";
@@ -11,8 +14,18 @@ import { runProcess, withBackoff } from "../youtube/subprocess";
 import { extractYouTubeTranscript } from "../youtube/transcript";
 import { parseYouTubeUrl, YouTubeUrlError } from "../youtube/url";
 
+import { parseAndEnforceQuizMarkdown, generateConceptFallbackQuiz } from "../lib/quiz";
+import { deduplicateAndCleanFrames, cleanOcrText } from "../lib/ocrCleaner";
+import { synthesizeLectureNotes } from "../lib/lectureSynthesizer";
+import { validateLectureNotes, sanitizeMarkdown } from "../lib/notesValidator";
+import { generateNotesPdf } from "../lib/pdfExporter";
+
 const execFileAsync = promisify(execFile);
 const router: IRouter = Router();
+
+// Model to use — override via OPENAI_MODEL env var, default to gpt-4o
+const OPENAI_MODEL = process.env["OPENAI_MODEL"] ?? "gpt-4o";
+
 
 // ─── In-memory job store ─────────────────────────────────────────────────────
 // Each job accumulates SSE event strings. Active SSE connections register a
@@ -86,96 +99,112 @@ function heartbeat(res: Response): ReturnType<typeof setInterval> {
 type NoteMode = "smart" | "exact" | "detailed" | "exam" | "flashcards" | "quiz";
 
 const NOTES_SYSTEM: Record<NoteMode, string> = {
-  exact: `You are a precise note-taking AI inside a Smart Lecture Notes Generator.
-Convert OCR text extracted from frames of a lecture/tutorial video into clean, structured study notes in MARKDOWN.
-EXACT MODE rules:
-- Preserve every meaningful detail. Do not skip information.
-- Keep code blocks exactly as seen (fenced code blocks with a language hint when obvious).
-- Maintain the original order of steps.
-- Merge duplicates and OCR noise but never lose unique content.
-- Use clear ## and ### headings, bullet points, and numbered lists for steps.
-- Highlight formulas using inline math style or fenced math blocks.
-- Do not invent content. Do not add filler explanations.
-Output ONLY the markdown notes. No preamble.`,
+  exact: `You are an expert DSA & computer science educator and precise note-taking AI.
+Convert extracted OCR frames and lecture materials into clean, highly readable, structured study notes in MARKDOWN.
 
-  smart: `You are a smart note-taking AI inside a Smart Lecture Notes Generator.
-Convert OCR text extracted from frames of a lecture/tutorial video into clean, structured study notes in MARKDOWN.
-SMART MODE rules:
-- Remove repetition and OCR noise.
-- Merge similar concepts into one clear explanation.
-- Keep only important and useful information.
-- Improve readability while staying faithful to the source.
-- Use clear ## and ### headings, bullet points, numbered steps, and fenced code blocks where relevant.
-- Highlight formulas if present.
-- Output should be concise, structured, and easy to revise from.
-- Do not invent facts; only reorganize and clarify what is in the OCR.
-Output ONLY the markdown notes. No preamble.`,
+EXACT MODE RULES:
+1. STRUCTURE & ORGANIZATION:
+   - Provide clear, professional study notes organized into logical conceptual sections.
+   - DO NOT output raw frame-by-frame lists, "Frame 1..N", or "Topic Segment 1..N".
+   - Start with a single '# [Lecture Title]' heading.
+2. CONCEPTUAL CLARITY & DSA ACCURACY:
+   - For DSA / algorithm lectures, clearly explain:
+     * Problem Statement, Constraints, and State Representation (e.g. 2D grid/matrix coordinates).
+     * Core Intuition: Why naive recursion fails (e.g. infinite cycles) and why state tracking (e.g. visited array) is necessary.
+     * Backtracking Mechanism: Explain the choose -> explore -> unchoose (backtrack) workflow clearly.
+     * Safe Move Conditions: Boundary checks, obstacle checks, unvisited checks.
+     * Complexity Analysis: Detail Time and Space Complexity.
+3. CODE & SYNTAX INTEGRITY:
+   - Output clean, complete, and syntax-valid C++ code blocks with language hints (\`\`\`cpp).
+   - Repair OCR typos in code (e.g. '#|nclude' -> '#include', '1nt' -> 'int', 'pr1ntf' -> 'printf', 'vector<vector<1nt>>' -> 'vector<vector<int>>').
+   - If an OCR detail is illegible and cannot be reliably resolved, annotate it transparently with a comment rather than inventing arbitrary code.
+4. CLEANLINESS:
+   - Strip all repeated slide titles, platform watermarks, sponsor text, and video player UI.
+Output ONLY the markdown notes. No conversational preamble.`,
 
-  detailed: `You are a thorough note-taking AI inside a Smart Lecture Notes Generator.
-Convert OCR text from lecture video frames into comprehensive, detailed study notes in MARKDOWN.
-DETAILED MODE rules:
-- Start with a ## Summary section (3-5 sentences overview).
-- Add a ## Key Concepts section (bullet list of important terms, each with a 1-2 sentence explanation).
-- Add a ## Important Formulas or Definitions section if any are present.
-- Add a ## Interview Questions section with 5 likely questions and concise answers.
-- Then produce full ## section notes in order, with all details preserved.
-- Include code blocks with language hints.
-- End with a ## Action Items / Takeaways section.
-- Use ## for major topics, ### for subtopics.
-- Do not invent content.
-Output ONLY the markdown notes. No preamble.`,
+  smart: `You are an expert DSA educator and smart study note creator inside a Smart Lecture Notes system.
+Convert extracted lecture OCR and content into concise, elegant, beginner-friendly study notes in MARKDOWN.
 
-  exam: `You are an exam-prep AI inside a Smart Lecture Notes Generator.
-Convert OCR text from lecture video frames into structured exam revision notes in MARKDOWN.
-EXAM REVISION MODE rules:
-- Start with a ## Quick Summary (2-4 sentences, the absolute essentials).
-- Add a ## Key Concepts to Know section (most testable ideas, each defined clearly).
-- Add a ## Formulas and Definitions section if any are present.
-- Add a ## Common Exam Questions section: 5-8 likely exam questions with concise answers.
-- Add a ## Practice Questions section: 3-5 short-answer questions (no answers, for self-testing).
-- Add a ## Things to Remember / Watch Out For section: common mistakes or tricky points.
-- Use bold for critical terms, code blocks for code and formulas.
-- Be concise and exam-focused.
-- Do not invent content.
-Output ONLY the markdown notes. No preamble.`,
+SMART MODE RULES:
+1. SYNTHESIS OVER DUMPING:
+   - Synthesize the core concepts into a cohesive, logically ordered study guide.
+   - NEVER dump raw frame-by-frame text or output "Topic Segment 1..N".
+   - Merge repeated slides and identical matrices into a single, well-explained example.
+2. DSA LECTURE STRUCTURE:
+   - # [Lecture Title]
+   - ## Problem Overview: Clear explanation of the problem, input/output, and visual representation (e.g. ASCII grid or matrix).
+   - ## Intuition & The Backtracking Approach: Explain why backtracking is needed, why cycles occur without visited tracking, and how backtracking unwinds state.
+   - ## Algorithm & Step-by-Step Logic: Outline base cases, recursive transitions, and 'isSafe' criteria.
+   - ## Clean Implementation: Fully formatted, syntax-correct, well-commented C++ code.
+   - ## Dry Run / Example Trace: Concrete walkthrough of exploring paths from source to destination.
+   - ## Complexity Analysis: Time and Space Complexity with intuitive explanations.
+   - ## Key Takeaways & Pitfalls: Bullet points highlighting common mistakes (e.g. forgetting to unmark visited cells).
+3. TRANSPARENCY:
+   - Do not invent facts or guess unreadable code silently. If source text is partially corrupted, note it transparently.
+   - Eliminate all OCR noise, video player chrome, and sponsor ads.
+Output ONLY the markdown notes. No conversational preamble.`,
+
+  detailed: `You are a university DSA professor creating a comprehensive, in-depth study manual from a lecture.
+Convert extracted lecture content into thorough, highly educational study notes in MARKDOWN.
+
+DETAILED MODE RULES:
+1. COMPREHENSIVE SECTIONS:
+   - # [Lecture Title]
+   - ## Executive Summary: 3-5 sentence conceptual overview of the lecture topic.
+   - ## Problem Statement & Representation: Detailed problem definition, inputs, outputs, matrix grids, constraints.
+   - ## Core Concepts & Intuition: Deep dive into recursion trees, why infinite loops occur, state-space exploration, and visited array logic.
+   - ## Step-by-Step Algorithm & Safety Checks: Detailed explanation of coordinate transitions (D, L, R, U) and boundary conditions.
+   - ## Complete, Production-Ready C++ Implementation: Fully commented, robust C++ code.
+   - ## Detailed Dry Run / Execution Trace: Walk through step-by-step state changes on an example matrix.
+   - ## Time & Space Complexity Analysis: Thorough breakdown of upper bounds and auxiliary stack space.
+   - ## Interview & Exam Questions: 5 high-yield conceptual questions with concise answers.
+   - ## Common Pitfalls & Debugging Tips: Subtle bugs to watch out for in backtracking.
+2. CLEANLINESS & INTEGRITY:
+   - Repair all OCR code corruptions and syntax errors.
+   - Remove all repeated slide headers, channel watermarks, and sponsor promos.
+   - Never output raw frame dumps or "Topic Segment" placeholders.
+Output ONLY the markdown notes. No conversational preamble.`,
+
+  exam: `You are an expert technical interviewer and exam-prep instructor.
+Convert lecture materials into a high-yield exam revision guide in MARKDOWN.
+
+EXAM REVISION RULES:
+1. High-yield summary of definitions, formulas, and core algorithm mechanics.
+2. 'Things to Remember / Watch Out For' section with common bugs (e.g. missing base cases, not resetting visited states).
+3. Full syntax-correct C++ code template with comments on critical exam points.
+4. Practice interview / exam questions with model answers.
+5. Complexity summary table (Best, Average, Worst Time & Space).
+Output ONLY the markdown notes. No conversational preamble.`,
 
   flashcards: `You are a flashcard-generation AI inside a Smart Lecture Notes Generator.
-Convert OCR text from lecture video frames into a set of study flashcards in MARKDOWN.
-FLASHCARDS MODE rules:
-- Generate 10-25 flashcards depending on content volume.
-- Format EVERY card exactly like this:
+Convert the lecture content into a set of 8-15 high-quality conceptual flashcards in MARKDOWN.
 
+FORMAT:
 ---
-**Q:** [concise question]
-**A:** [clear, direct answer]
+**Q:** [Clear, conceptual question]
+**A:** [Direct, educational answer with code/formula if needed]
 
-- Questions should test one concept, formula, term, or step.
-- Cover all major topics from the lecture.
-- Use code blocks inside answers for code or formulas when needed.
-- Do not invent content.
-- Start with a ## Flashcards heading then list all cards.
-Output ONLY the flashcards in the format above. No preamble.`,
+Start with a ## Flashcards heading. Output ONLY the flashcards. No preamble.`,
 
-  quiz: `You are a quiz-generation AI inside a Smart Lecture Notes Generator.
-Convert OCR text from lecture video frames into a multiple-choice quiz in MARKDOWN.
-QUIZ MODE rules:
-- Generate 8-15 multiple-choice questions.
-- Format EVERY question exactly like this:
+  quiz: `You are a concept-testing quiz generation AI inside a Smart Lecture Notes Generator.
+Convert the lecture content into a 6-10 question conceptual multiple-choice quiz in MARKDOWN.
 
+CRITICAL RULES:
+- Test core algorithm understanding, backtracking rules, boundary conditions, and complexity.
+- Exactly 4 options (A, B, C, D) per question with distributed correct answers.
+- Provide an educational explanation for each answer.
+- DO NOT reference video timestamps or use "Topic Segment" filler.
+
+Format:
 ---
-**Q[n].** [question text]
-- A) [option]
-- B) [option]
-- C) [option]
-- D) [option]
-**Answer:** [letter] — [1-sentence explanation]
+**Q[n].** [Conceptual question]
+- A) [Option]
+- B) [Option]
+- C) [Option]
+- D) [Option]
+**Answer:** [A/B/C/D] — [Explanation]
 
-- Questions should range from easy to hard.
-- Cover all major topics.
-- Distractors should be plausible but clearly wrong on reflection.
-- Do not invent content.
-- Start with a ## Quiz heading.
-Output ONLY the quiz in the format above. No preamble.`,
+Start with # Practice Quiz: [Lecture Title]. Output ONLY the quiz. No preamble.`,
 };
 
 router.post("/notes/generate", async (req, res) => {
@@ -189,36 +218,168 @@ router.post("/notes/generate", async (req, res) => {
     const mode: NoteMode = validModes.includes(body.mode as NoteMode)
       ? (body.mode as NoteMode)
       : "smart";
-    const frames = Array.isArray(body.frames) ? body.frames : [];
+    const rawFrames = Array.isArray(body.frames) ? body.frames : [];
 
-    if (frames.length === 0) {
+    if (rawFrames.length === 0) {
       res.status(400).json({ error: "No frames provided" });
       return;
     }
 
-    const joined = frames
-      .map(
-        (f, i) =>
-          `--- Frame ${i + 1} (t=${Math.round(f.timestamp)}s) ---\n${(f.text || "").trim()}`,
-      )
-      .join("\n\n");
+    const title = (body.title && body.title.trim()) || "Lecture Notes";
 
-    const userPrompt = `Lecture title: ${body.title || "Untitled"}\n\nOCR text from sequential video frames:\n\n${joined}`;
+    // Deduplicate and clean frames to remove repeated banners and jitter
+    const cleanedFrames = deduplicateAndCleanFrames(rawFrames);
+    const framesToUse = cleanedFrames.length > 0 ? cleanedFrames : rawFrames.map((f) => ({
+      timestamp: f.timestamp,
+      text: cleanOcrText(f.text),
+    }));
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 8192,
-      messages: [
-        { role: "system", content: NOTES_SYSTEM[mode] },
-        { role: "user", content: userPrompt },
-      ],
+    let notes = "";
+    let generatedByAi = false;
+
+    // Check if an AI client can be called
+    try {
+      const joined = framesToUse
+        .slice(0, 40) // Prevent token overflow from excessive frames
+        .map((f, i) => `--- Content Segment ${i + 1} (t=${Math.round(f.timestamp)}s) ---\n${f.text.trim()}`)
+        .join("\n\n");
+
+      const userPrompt = `Lecture Title: ${title}\n\nExtracted sequential lecture content:\n\n${joined}`;
+
+      const completion = await openai.chat.completions.create({
+        model: OPENAI_MODEL,
+        max_completion_tokens: 8192,
+        messages: [
+          { role: "system", content: NOTES_SYSTEM[mode] },
+          { role: "user", content: userPrompt },
+        ],
+      });
+
+      const aiResponse = completion.choices[0]?.message?.content ?? "";
+      if (aiResponse && aiResponse.trim().length >= 300) {
+        notes = aiResponse;
+        generatedByAi = true;
+      }
+    } catch (aiErr) {
+      req.log.warn(
+        { err: aiErr instanceof Error ? aiErr.message : String(aiErr) },
+        "AI completion unavailable or failed — synthesizing structured study notes"
+      );
+    }
+
+    // If AI was unavailable, failed, or produced insufficient text, synthesize intelligent notes
+    if (!notes || notes.trim().length < 300) {
+      notes = synthesizeLectureNotes(mode, title, rawFrames);
+    }
+
+    // Sanitize markdown formatting
+    notes = sanitizeMarkdown(notes);
+
+    // Validate quality, structure, repetition, and code integrity
+    const validation = validateLectureNotes(notes, title);
+
+    // If validation fails due to raw frame dumps or excessive repetition,
+    // re-synthesize cleanly to prevent degraded notes from being served
+    if (!validation.isValid) {
+      req.log.warn(
+        { errors: validation.errors },
+        "Notes failed quality validation — regenerating via structured synthesizer"
+      );
+      notes = sanitizeMarkdown(synthesizeLectureNotes(mode, title, rawFrames));
+    }
+
+    if (mode === "quiz" && notes) {
+      notes = parseAndEnforceQuizMarkdown(notes, title);
+    }
+
+    const finalValidation = validateLectureNotes(notes, title);
+
+    res.json({
+      notes,
+      mode,
+      quality: {
+        score: finalValidation.score,
+        isValid: finalValidation.isValid,
+        generatedByAi,
+        warnings: finalValidation.warnings,
+      },
     });
-
-    const notes = completion.choices[0]?.message?.content ?? "";
-    res.json({ notes, mode });
   } catch (err) {
     req.log.error({ err }, "notes generation failed");
     res.status(500).json({ error: "Failed to generate notes" });
+  }
+});
+
+// ─── Direct PDF Export Endpoint (Streams attachment with Content-Disposition) ─
+router.post("/notes/export/pdf", (req: Request, res: Response) => {
+  try {
+    const { notes, title, mode, fileName } = req.body as {
+      notes?: string;
+      title?: string;
+      mode?: string;
+      fileName?: string;
+    };
+
+    if (!notes || typeof notes !== "string" || !notes.trim()) {
+      res.status(400).json({ error: "Missing or empty notes content" });
+      return;
+    }
+
+    const docTitle = (title && title.trim()) || "Lecture Notes";
+    const doc = generateNotesPdf(notes, docTitle);
+    const arrayBuffer = doc.output("arraybuffer");
+    const pdfBuffer = Buffer.from(arrayBuffer);
+
+    let cleanName = (fileName && fileName.trim()) || "";
+    if (!cleanName) {
+      let raw = docTitle
+        .replace(/[/\\?%*:|"<>]/g, "")
+        .replace(/[^\w\s-]/g, "")
+        .trim()
+        .replace(/\s+/g, "-");
+      if (!raw) raw = "Lecture";
+      let suffix = "Notes";
+      if (mode === "quiz") suffix = "Quiz";
+      else if (mode === "flashcards") suffix = "Flashcards";
+      if (raw.toLowerCase().endsWith(suffix.toLowerCase())) {
+        raw = raw.slice(0, -suffix.length).replace(/-+$/, "");
+      }
+      cleanName = `${raw ? `${raw}-${suffix}` : suffix}.pdf`;
+    }
+    if (!cleanName.endsWith(".pdf")) cleanName += ".pdf";
+
+    // Save direct copy to Downloads folder on local system
+    const userDownloads = process.env.USERPROFILE ? pathJoin(process.env.USERPROFILE, "Downloads") : null;
+    if (userDownloads && existsSync(userDownloads)) {
+      try {
+        const dest = pathJoin(userDownloads, cleanName);
+        writeFileSync(dest, pdfBuffer);
+        req.log.info({ dest, bytes: pdfBuffer.length }, "Saved PDF directly to user Downloads folder");
+      } catch (writeErr) {
+        req.log.warn({ writeErr }, "Failed writing to user Downloads folder");
+      }
+    }
+    // Also save in scratch/ for local validation
+    try {
+      const scratchDir = pathJoin(process.cwd(), "scratch");
+      if (existsSync(scratchDir)) {
+        writeFileSync(pathJoin(scratchDir, cleanName), pdfBuffer);
+      }
+    } catch { /* ignore */ }
+
+    req.log.info({ fileName: cleanName, docTitle, byteLength: pdfBuffer.length }, "Serving PDF attachment download");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+    );
+    res.setHeader("Content-Length", String(pdfBuffer.length));
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.end(pdfBuffer);
+  } catch (err) {
+    req.log.error({ err }, "PDF export failed");
+    res.status(500).json({ error: "Failed to generate PDF" });
   }
 });
 
@@ -278,7 +439,8 @@ router.post("/youtube/start", async (req: Request, res: Response) => {
   const endSec: number | null = rawEnd != null && rawEnd !== undefined ? Math.max(startSec + 1, Number(rawEnd)) : null;
 
   const jobId = randomUUID();
-  const tmpDir = `/tmp/yt-${videoId}-${jobId.slice(0, 8)}`;
+  // Use path.join to avoid mixed backslash/forward-slash paths on Windows
+  const tmpDir = pathJoin(os.tmpdir(), `yt-${videoId}-${jobId.slice(0, 8)}`);
   const job: YtJob = {
     status: "queued",
     events: [],
@@ -355,7 +517,6 @@ function getAdaptiveInterval(durationSec: number): number {
 
 // ─── Download video with yt-dlp, streaming progress events to SSE ─────────────
 // Returns the path to the downloaded video file.
-// Tries multiple player clients in order until one succeeds.
 async function downloadWithYtDlp(
   videoId: string,
   outputPath: string,
@@ -363,79 +524,81 @@ async function downloadWithYtDlp(
   log: Request["log"],
   jobId: string,
 ): Promise<void> {
-  // Try supported clients in order. Do not add unofficial clients or scraping
-  // workarounds here: YouTube may require authentication or a PO token.
+  const ytdlpBin = await getYtDlpPath();
+  const ffmpegPath = await getFfmpegPath().catch(() => null);
   const clients = ["android", "ios", "tv_embedded"];
   let lastError = "";
-  const ytdlpBin = await getYtDlpPath();
 
   for (const client of clients) {
     const ytdlpArgs = [
       "--no-playlist",
       "--no-check-certificate",
       "--extractor-args", `youtube:player_client=${client}`,
-      "--format", "18/best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best",
+      // Prefer a progressive/single-file format first to avoid ffmpeg merge path issues.
+      // Falls back to DASH merge (with explicit mp4 container) if no single-file format exists.
+      "--format", "best[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]+bestaudio/best",
+      "--merge-output-format", "mp4",
       "--output", outputPath,
-      "--no-part",    // write directly to final path, no .part temp file
       "--newline",    // one progress line per newline (easier to parse)
+      ...(ffmpegPath ? ["--ffmpeg-location", ffmpegPath] : []),
       `https://www.youtube.com/watch?v=${videoId}`,
     ];
 
     log.info({ jobId, videoId, client, cmd: `${ytdlpBin} ${ytdlpArgs.join(" ")}` }, "yt-dlp command");
 
     try {
-      const stderrOut = await withBackoff(
-        async () => {
-          const output = await runProcess(ytdlpBin, ytdlpArgs, {
-            timeoutMs: 120_000,
-            onStdout: (text) => {
-              for (const line of text.split("\n")) {
-                const progress = line.match(
-                  /\[download\]\s+([\d.]+)%\s+of\s+\S+\s+at\s+(\S+)\s+ETA\s+(\S+)/,
-                );
-                if (progress) {
-                  pushEvent(job, "download_progress", {
-                    pct: parseFloat(progress[1]),
-                    speed: progress[2],
-                    eta: progress[3],
-                  });
-                }
+    const stderrOut = await withBackoff(
+      async () => {
+        const output = await runProcess(ytdlpBin, ytdlpArgs, {
+          timeoutMs: 120_000,
+          onStdout: (text) => {
+            for (const line of text.split("\n")) {
+              const progress = line.match(
+                /\[download\]\s+([\d.]+)%\s+of\s+\S+\s+at\s+(\S+)\s+ETA\s+(\S+)/,
+              );
+              if (progress) {
+                pushEvent(job, "download_progress", {
+                  pct: parseFloat(progress[1]),
+                  speed: progress[2],
+                  eta: progress[3],
+                });
               }
-            },
-          });
+            }
+          },
+        });
 
-          if (output.timedOut) {
-            throw new Error(
-              `yt-dlp timed out after 120 seconds.\n${output.stderr}\n${output.stdout}`.trim(),
-            );
-          }
-          if (output.code !== 0) {
-            // Preserve complete stdout + stderr for classification and logs.
-            throw new Error((output.stderr + "\n" + output.stdout).trim());
-          }
-          return output.stderr;
-        },
-        (error) => {
-          const raw = error instanceof Error ? error.message : String(error);
-          return classifyYouTubeError(raw).retryable;
-        },
-        { attempts: 2, baseDelayMs: 750 },
-      );
+        if (output.timedOut) {
+          throw new Error(
+            `yt-dlp timed out after 120 seconds.\n${output.stderr}\n${output.stdout}`.trim(),
+          );
+        }
+        if (output.code !== 0) {
+          throw new Error((output.stderr + "\n" + output.stdout).trim());
+        }
+        return output.stderr;
+      },
+      (error) => {
+        const raw = error instanceof Error ? error.message : String(error);
+        return classifyYouTubeError(raw).retryable;
+      },
+      { attempts: 2, baseDelayMs: 750 },
+    );
 
-      // Success — log any non-fatal warnings and return
       if (stderrOut.trim()) {
         log.warn({ jobId, videoId, client, stderr: stderrOut }, "yt-dlp stderr (non-fatal warnings)");
       }
       log.info({ jobId, videoId, client }, "yt-dlp download succeeded");
       return; // done
-
     } catch (clientErr: unknown) {
       lastError = clientErr instanceof Error ? clientErr.message : String(clientErr);
-      const classified = classifyYouTubeError(lastError);
-      log.warn({ jobId, videoId, client, code: classified.code, stderr: lastError }, "yt-dlp client failed");
-
+      log.warn({ jobId, videoId, client, err: lastError.slice(0, 600) }, "yt-dlp client failed — trying next");
+      
       // Stop early for definitive blocks (no point trying other clients)
-      if (!classified.retryable) break;
+      if (/private video|video is private/i.test(lastError)) break;
+      if (/age.?restrict|confirm your age/i.test(lastError)) break;
+      if (/unavailable.*app|not available.*app/i.test(lastError)) {
+        continue;
+      }
     }
   }
 
@@ -452,8 +615,9 @@ async function runYouTubeJob(
 ) {
   const { videoId, requestedInterval, autoInterval, startSec, endSec } = opts;
   let effectiveInterval = requestedInterval > 0 ? requestedInterval : 10;
-  const videoFile = `${job.tmpDir}/video.mp4`;
-  const framesDir = `${job.tmpDir}/frames`;
+  // Use path.join to avoid mixed path separators on Windows
+  const videoFile = pathJoin(job.tmpDir, "video.mp4");
+  const framesDir = pathJoin(job.tmpDir, "frames");
 
   try {
     await mkdir(framesDir, { recursive: true });
@@ -484,17 +648,7 @@ async function runYouTubeJob(
       return;
     }
 
-    if (transcript.status === "unavailable" && transcript.reason === "blocked" && transcript.raw) {
-      const transcriptFailure = classifyYouTubeError(transcript.raw);
-      if (
-        ["bot_blocked", "private", "age_restricted", "geo_blocked", "tool_missing"].includes(
-          transcriptFailure.code,
-        )
-      ) {
-        failJob(jobId, job, "transcript", transcriptFailure.message, log, transcript.raw);
-        return;
-      }
-    }
+    log.info({ jobId, videoId }, "Transcript not available; continuing to video download & frame extraction");
 
     // ── Phase 2: Download video with yt-dlp ─────────────────────────────────
     job.status = "downloading";
@@ -583,7 +737,7 @@ async function runYouTubeJob(
       "-vf", `fps=1/${effectiveInterval},scale='min(960\\,iw)':-2`,
       "-qscale:v", "5",
       "-f", "image2",
-      `${framesDir}/frame_%04d.jpg`,
+      pathJoin(framesDir, "frame_%04d.jpg"),
     ];
     const ffmpegBin = await getFfmpegPath();
     log.info({ jobId, videoId, cmd: `${ffmpegBin} ${ffmpegArgs.join(" ")}` }, "ffmpeg command");
@@ -620,7 +774,7 @@ async function runYouTubeJob(
         "frame_extraction",
         "No frames could be extracted from the video. Try adjusting the interval or time range.",
         log,
-        `No JPG files in ${framesDir}`,
+        `No JPG files in ${framesDir}` as string,
       );
       return;
     }
@@ -628,7 +782,7 @@ async function runYouTubeJob(
     pushEvent(job, "frame_count", { count: frameFiles.length, duration });
 
     for (let i = 0; i < frameFiles.length; i++) {
-      const framePath = `${framesDir}/${frameFiles[i]}`;
+      const framePath = pathJoin(framesDir, frameFiles[i]);
       const data = await readFile(framePath);
       const timestamp = startSec + i * effectiveInterval;
       pushEvent(job, "frame", {
@@ -766,7 +920,7 @@ router.post("/assistant/chat", async (req, res) => {
     res.flushHeaders();
 
     const stream = await openai.chat.completions.create({
-      model: "gpt-5.4",
+      model: OPENAI_MODEL,
       max_completion_tokens: 8192,
       stream: true,
       messages: [
@@ -786,8 +940,16 @@ router.post("/assistant/chat", async (req, res) => {
     res.end();
   } catch (err) {
     req.log.error({ err }, "assistant chat failed");
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const isAuthError =
+      (err as { status?: number }).status === 401 ||
+      /invalid_api_key|Incorrect API key|AuthenticationError/i.test(errMsg);
     if (!res.headersSent) {
-      res.status(500).json({ error: "Assistant failed" });
+      res.status(isAuthError ? 401 : 500).json({
+        error: isAuthError
+          ? "OpenAI API key is invalid or not configured. Set OPENAI_API_KEY in artifacts/api-server/.env and restart."
+          : "Assistant failed",
+      });
     } else {
       res.write(`data: ${JSON.stringify({ t: "\n\n*Error: could not complete response.*" })}\n\n`);
       res.write("data: [DONE]\n\n");

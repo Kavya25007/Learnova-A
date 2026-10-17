@@ -51,12 +51,14 @@ export async function fetchYouTubeMetadata(
       { attempts: 3, baseDelayMs: 400 },
     );
 
-    return {
-      title: data.title ?? "",
-      channel: data.author_name ?? "",
-      thumbnail: data.thumbnail_url ?? "",
-      videoId: parsed.videoId,
-    };
+    if (data.title) {
+      return {
+        title: data.title,
+        channel: data.author_name ?? "YouTube",
+        thumbnail: data.thumbnail_url ?? `https://i.ytimg.com/vi/${parsed.videoId}/hqdefault.jpg`,
+        videoId: parsed.videoId,
+      };
+    }
   } catch (oembedError) {
     const rawOembedError =
       oembedError instanceof Error ? oembedError.message : String(oembedError);
@@ -68,47 +70,65 @@ export async function fetchYouTubeMetadata(
 
   try {
     const ytdlpBin = await getYtDlpPath();
-    const result = await withBackoff(
-      async () => {
-        const output = await runProcess(
-          ytdlpBin,
-          [
-            "--dump-single-json",
-            "--skip-download",
-            "--no-playlist",
-            "--no-warnings",
-            "--no-check-certificate",
-            parsed.canonicalUrl,
-          ],
-          { timeoutMs: 20_000 },
-        );
-        if (output.timedOut) throw new Error("yt-dlp metadata request timed out.");
-        if (output.code !== 0) {
-          throw new Error((output.stderr + "\n" + output.stdout).trim());
-        }
-        return output;
-      },
-      (error) =>
-        classifyYouTubeError(error instanceof Error ? error.message : String(error)).retryable,
-      { attempts: 2, baseDelayMs: 750 },
-    );
+    const clients = ["android", "ios", "tv_embedded"];
+    let lastYtDlpError = "";
 
-    const data = JSON.parse(result.stdout) as {
-      title?: string;
-      uploader?: string;
-      channel?: string;
-      thumbnail?: string;
-    };
-    log.info({ videoId: parsed.videoId, stderr: result.stderr || undefined }, "yt-dlp metadata succeeded");
-    return {
-      title: data.title ?? "",
-      channel: data.uploader ?? data.channel ?? "",
-      thumbnail: data.thumbnail ?? "",
-      videoId: parsed.videoId,
-    };
+    for (const client of clients) {
+      try {
+        const result = await withBackoff(
+          async () => {
+            const output = await runProcess(
+              ytdlpBin,
+              [
+                "--dump-single-json",
+                "--skip-download",
+                "--no-playlist",
+                "--no-warnings",
+                "--no-check-certificate",
+                "--extractor-args", `youtube:player_client=${client}`,
+                parsed.canonicalUrl,
+              ],
+              { timeoutMs: 20_000 },
+            );
+            if (output.timedOut) throw new Error("yt-dlp metadata request timed out.");
+            if (output.code !== 0) {
+              throw new Error((output.stderr + "\n" + output.stdout).trim());
+            }
+            return output;
+          },
+          (error) =>
+            classifyYouTubeError(error instanceof Error ? error.message : String(error)).retryable,
+          { attempts: 2, baseDelayMs: 750 },
+        );
+
+        const data = JSON.parse(result.stdout) as {
+          title?: string;
+          uploader?: string;
+          channel?: string;
+          thumbnail?: string;
+        };
+        log.info({ videoId: parsed.videoId, client, stderr: result.stderr || undefined }, "yt-dlp metadata succeeded");
+        return {
+          title: data.title ?? `YouTube Video (${parsed.videoId})`,
+          channel: data.uploader ?? data.channel ?? "YouTube",
+          thumbnail: data.thumbnail ?? `https://i.ytimg.com/vi/${parsed.videoId}/hqdefault.jpg`,
+          videoId: parsed.videoId,
+        };
+      } catch (clientErr) {
+        lastYtDlpError = clientErr instanceof Error ? clientErr.message : String(clientErr);
+        log.warn({ videoId: parsed.videoId, client, err: lastYtDlpError.slice(0, 400) }, "yt-dlp metadata client failed");
+      }
+    }
+    log.warn({ videoId: parsed.videoId, lastError: lastYtDlpError }, "All yt-dlp metadata clients failed; using fallback metadata");
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
-    log.warn({ videoId: parsed.videoId, stderr: raw }, "yt-dlp metadata failed");
-    throw error;
+    log.warn({ videoId: parsed.videoId, stderr: raw }, "yt-dlp metadata failed; using fallback metadata");
   }
+
+  return {
+    title: `YouTube Video (${parsed.videoId})`,
+    channel: "YouTube",
+    thumbnail: `https://i.ytimg.com/vi/${parsed.videoId}/hqdefault.jpg`,
+    videoId: parsed.videoId,
+  };
 }

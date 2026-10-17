@@ -2,25 +2,39 @@ import OpenAI from "openai";
 
 // Lazy singleton — env vars are checked only on first use, not at import time.
 // This allows the API server to start and serve non-AI endpoints (e.g. /youtube/meta)
-// even when AI_INTEGRATIONS_OPENAI_* vars are not yet configured.
+// even when AI vars are not yet configured.
+//
+// Supports two modes:
+//   1. Standard OpenAI:  set OPENAI_API_KEY=sk-...
+//   2. Replit AI Proxy:  set AI_INTEGRATIONS_OPENAI_BASE_URL + AI_INTEGRATIONS_OPENAI_API_KEY
 
 let _client: OpenAI | undefined;
 
 function requireOpenAI(): OpenAI {
   if (!_client) {
-    const baseURL = process.env["AI_INTEGRATIONS_OPENAI_BASE_URL"];
-    const apiKey = process.env["AI_INTEGRATIONS_OPENAI_API_KEY"];
-    if (!baseURL) {
+    // Mode 1: Replit AI Integrations proxy (takes precedence when both vars are set)
+    const replitBaseURL = process.env["AI_INTEGRATIONS_OPENAI_BASE_URL"];
+    const replitApiKey = process.env["AI_INTEGRATIONS_OPENAI_API_KEY"];
+
+    // Mode 2: Standard OpenAI API key
+    const openaiApiKey = process.env["OPENAI_API_KEY"];
+
+    if (replitBaseURL && replitApiKey) {
+      // Replit managed AI proxy
+      _client = new OpenAI({ apiKey: replitApiKey, baseURL: replitBaseURL });
+    } else if (openaiApiKey) {
+      // Standard OpenAI — no baseURL needed, uses api.openai.com by default
+      _client = new OpenAI({ apiKey: openaiApiKey });
+    } else {
       throw new Error(
-        "AI_INTEGRATIONS_OPENAI_BASE_URL must be set. Did you forget to provision the OpenAI AI integration?",
+        "OpenAI API key is not configured.\n" +
+        "To enable AI note generation:\n" +
+        "  1. Get an API key from https://platform.openai.com/api-keys\n" +
+        "  2. Set the environment variable: OPENAI_API_KEY=sk-...\n" +
+        "  3. Restart the server.\n" +
+        "(YouTube processing and local file OCR work without this key.)",
       );
     }
-    if (!apiKey) {
-      throw new Error(
-        "AI_INTEGRATIONS_OPENAI_API_KEY must be set. Did you forget to provision the OpenAI AI integration?",
-      );
-    }
-    _client = new OpenAI({ apiKey, baseURL });
   }
   return _client;
 }
