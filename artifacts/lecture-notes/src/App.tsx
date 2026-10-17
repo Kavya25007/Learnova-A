@@ -65,7 +65,8 @@ function getSuccessMessage(m: Mode): string {
   return "Notes are ready!";
 }
 
-const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
+   const apiBase = ((import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.BASE_URL || "/")).replace(/\/$/, "") + "/api";
+
 
 const AI_LOADING_MSGS = [
   "Reading your lecture...",
