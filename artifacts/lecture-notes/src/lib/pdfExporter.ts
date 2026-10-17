@@ -1,6 +1,6 @@
 import { jsPDF } from "jspdf";
 
-const apiBase = (import.meta.env.BASE_URL || "/").replace(/\/$/, "") + "/api";
+const apiBase = ((import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.BASE_URL || "/")).replace(/\/$/, "") + "/api";
 
 /**
  * Cleans inline markdown artifacts, formatting markers, and LaTeX formulas
