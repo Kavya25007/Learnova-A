@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Chat } from "./components/Chat";
@@ -17,7 +17,6 @@ import {
   Copy,
   Check,
   Trash2,
-  Youtube,
   X,
   Moon,
   Sun,
@@ -35,7 +34,6 @@ import {
 
 type Mode = "smart" | "exact" | "detailed" | "exam" | "flashcards" | "quiz";
 
-type YtMeta = { title: string; channel: string; thumbnail: string };
 
 type Frame = {
   id: string;
@@ -85,7 +83,7 @@ const PROCESSING_STEPS = [
 
 const BENEFITS = [
   "Save hours of note-making",
-  "Works with YouTube videos",
+  "Works with any lecture video file",
   "AI-structured notes",
   "Flashcards & quiz modes",
   "Smart OCR technology",
@@ -283,12 +281,6 @@ function formatTime(sec: number): string {
 export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string>("");
-  const [youtubeUrl, setYoutubeUrl] = useState<string>("");
-  const [ytVideoError, setYtVideoError] = useState<string>("");
-  const [ytDownloadPct, setYtDownloadPct] = useState<number>(0);
-  const [ytTotalFrames, setYtTotalFrames] = useState<number>(0);
-  const [ytSource, setYtSource] = useState<"video" | "transcript" | null>(null);
-  const sseRef = useRef<EventSource | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [interval, setIntervalVal] = useState<number>(AUTO_INTERVAL);
   const [videoKnownDuration, setVideoKnownDuration] = useState<number>(0);
@@ -321,17 +313,6 @@ export default function App() {
   const [darkMode, setDarkMode] = useState(() =>
     document.documentElement.classList.contains("dark"),
   );
-  const [ytMeta, setYtMeta] = useState<YtMeta | null>(null);
-  const [ytMetaLoading, setYtMetaLoading] = useState(false);
-  const [ytMetaError, setYtMetaError] = useState("");
-
-  type YtProcStatus = "idle" | "downloading" | "extracting" | "done" | "error";
-  const [ytDownloadStatus, setYtDownloadStatus] = useState<YtProcStatus>("idle");
-  const [ytExtractStatus, setYtExtractStatus] = useState<YtProcStatus>("idle");
-  const [ytErrorStep, setYtErrorStep] = useState("");
-  const [ytErrorMsg, setYtErrorMsg] = useState("");
-  const [ytDuration, setYtDuration] = useState(0);
-
   // Processing stats
   const [statFrames, setStatFrames] = useState(0);
   const [statOcr, setStatOcr] = useState(0);
@@ -359,60 +340,6 @@ export default function App() {
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
 
-  const ytEmbed = useMemo(() => {
-    if (!youtubeUrl) return "";
-    const m = youtubeUrl.match(
-      /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/,
-    );
-    return m ? `https://www.youtube.com/embed/${m[1]}` : "";
-  }, [youtubeUrl]);
-
-  // Extract video ID from YouTube URL
-  const ytVideoId = useMemo(() => {
-    if (!youtubeUrl) return "";
-    const m = youtubeUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([\w-]{6,})/);
-    return m ? m[1] : "";
-  }, [youtubeUrl]);
-
-  // Fetch YouTube metadata when URL changes (metadata only — no streaming)
-  useEffect(() => {
-    if (!youtubeUrl || !ytVideoId) {
-      setYtMeta(null);
-      setYtMetaError("");
-      setYtVideoError("");
-      setYtDownloadStatus("idle");
-      setYtExtractStatus("idle");
-      setYtErrorStep("");
-      setYtErrorMsg("");
-      setYtDuration(0);
-      return;
-    }
-    setYtMetaLoading(true);
-    setYtMetaError("");
-    setYtMeta(null);
-    setYtDownloadStatus("idle");
-    setYtExtractStatus("idle");
-    setYtErrorStep("");
-    setYtErrorMsg("");
-
-    fetch(`${apiBase}/youtube/meta?url=${encodeURIComponent(youtubeUrl)}`)
-      .then(async (r) => {
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({})) as { error?: string };
-          setYtMetaError(err.error || `Metadata fetch failed (HTTP ${r.status})`);
-          return;
-        }
-        const d = await r.json() as YtMeta;
-        setYtMeta(d);
-        if (!title && d.title) {
-          setTitle(d.title);
-        }
-      })
-      .catch((e: Error) => setYtMetaError(`Network error: ${e.message}`))
-      .finally(() => setYtMetaLoading(false));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [youtubeUrl, ytVideoId]);
-
   function reset() {
     cancelRef.current = false;
     setFrames([]);
@@ -424,16 +351,6 @@ export default function App() {
     setStatFrames(0);
     setStatOcr(0);
     setStatElapsed(0);
-    setYtDownloadStatus("idle");
-    setYtExtractStatus("idle");
-    setYtErrorStep("");
-    setYtErrorMsg("");
-    setYtVideoError("");
-    setYtDownloadPct(0);
-    setYtTotalFrames(0);
-    setYtSource(null);
-    // close any live SSE connection
-    if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
   }
 
   // Enhance canvas contrast/brightness to improve OCR
@@ -457,309 +374,7 @@ export default function App() {
     }
   }
 
-  // ── YouTube SSE-based processing ────────────────────────────────────────────
-  // Architecture:
-  //   1. POST /api/youtube/start  → returns { jobId } immediately (no timeout risk)
-  //   2. EventSource /api/youtube/events/:jobId  → long-lived SSE stream
-  //      - "download_progress" events keep the connection alive during yt-dlp
-  //      - "frame" events arrive one-by-one as ffmpeg extracts them
-  //      - "done" event triggers the browser OCR pipeline
-  // This eliminates the proxy timeout that killed the old blocking-fetch approach.
-  async function startYouTubeProcessing() {
-    reset();
-
-    let startSec = 0;
-    let endSec: number | null = null;
-    if (rangeMode === "custom") {
-      const s = parseTime(startTime);
-      const e = parseTime(endTime);
-      if (s == null || e == null || e <= s) {
-        alert("Enter valid start and end times (mm:ss).");
-        return;
-      }
-      startSec = s;
-      endSec = e;
-    }
-
-    setProcessing(true);
-    cancelRef.current = false;
-    processingStartRef.current = Date.now();
-    elapsedTimerRef.current = window.setInterval(() => {
-      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
-    }, 1000);
-
-    // ── Step 1: Start the job ────────────────────────────────────────────────
-    let jobId: string;
-    try {
-      setYtDownloadStatus("downloading");
-      setPhase("Starting download...");
-      setProgress(5);
-
-      const startRes = await fetch(`${apiBase}/youtube/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: youtubeUrl,
-          interval: interval === AUTO_INTERVAL ? AUTO_INTERVAL : interval,
-          startTime: startSec,
-          endTime: endSec ?? undefined,
-        }),
-      });
-
-      if (!startRes.ok) {
-        const err = await startRes.json().catch(() => ({})) as { error?: string; step?: string };
-        const msg = err.error || `Server error (HTTP ${startRes.status})`;
-        setYtDownloadStatus("error");
-        setYtErrorStep(err.step || "start");
-        setYtErrorMsg(msg);
-        setYtVideoError(msg);
-        setPhase(`Failed: ${msg}`);
-        setProcessing(false);
-        if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
-        return;
-      }
-      const startData = await startRes.json() as { jobId: string };
-      jobId = startData.jobId;
-    } catch (e) {
-      const msg = `Network error: ${(e as Error).message}`;
-      setYtDownloadStatus("error");
-      setYtErrorStep("network");
-      setYtErrorMsg(msg);
-      setYtVideoError(msg);
-      setPhase("Could not reach server.");
-      setProcessing(false);
-      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
-      return;
-    }
-
-    // ── Step 2: Open EventSource and collect frames ──────────────────────────
-    const capturedRef: Frame[] = [];
-    let totalExpected = 0;
-    // Track whether an error was signalled inside the SSE promise so we don't
-    // read the stale ytErrorMsg closure value after awaiting.
-    let hadError = false;
-
-    await new Promise<void>((resolve) => {
-      const sse = new EventSource(`${apiBase}/youtube/events/${jobId}`);
-      sseRef.current = sse;
-
-      sse.addEventListener("status", (e: MessageEvent) => {
-        if (cancelRef.current) { sse.close(); resolve(); return; }
-        const d = JSON.parse(e.data) as { step: string; message: string };
-        if (d.step === "downloading") {
-          setYtDownloadStatus("downloading");
-          setPhase("Downloading video from YouTube...");
-          setProgress(10);
-        } else if (d.step === "transcript") {
-          setYtDownloadStatus("downloading");
-          setPhase("Checking for public captions...");
-          setProgress(8);
-        } else if (d.step === "extracting") {
-          setYtDownloadStatus("done");
-          setYtExtractStatus("extracting");
-          setPhase("Extracting frames...");
-          setProgress(50);
-        }
-      });
-
-      sse.addEventListener("download_progress", (e: MessageEvent) => {
-        if (cancelRef.current) { sse.close(); resolve(); return; }
-        const d = JSON.parse(e.data) as { pct: number; speed?: string; eta?: string };
-        setYtDownloadPct(d.pct);
-        const speed = d.speed ? ` at ${d.speed}` : "";
-        const eta = d.eta ? ` — ETA ${d.eta}` : "";
-        setPhase(`Downloading${speed}${eta}`);
-        setProgress(10 + Math.round(d.pct * 0.38));
-      });
-
-      sse.addEventListener("frame_count", (e: MessageEvent) => {
-        const d = JSON.parse(e.data) as { count: number; duration: number };
-        totalExpected = d.count;
-        setYtTotalFrames(d.count);
-        setYtDuration(d.duration);
-        setYtExtractStatus("done");
-        setPhase(`Receiving ${d.count} frame(s)...`);
-        setProgress(50);
-      });
-
-      sse.addEventListener("transcript", (e: MessageEvent) => {
-        if (cancelRef.current) { sse.close(); resolve(); return; }
-        const d = JSON.parse(e.data) as {
-          segments: { start: number; text: string }[];
-          duration: number;
-        };
-        const transcriptFrames: Frame[] = d.segments
-          .filter((segment) => segment.text.trim())
-          .map((segment, index) => ({
-            id: `transcript-${index}-${segment.start.toFixed(2)}`,
-            timestamp: segment.start,
-            thumb: ytMeta?.thumbnail || "",
-            hash: "",
-            text: segment.text.trim(),
-            ocrProgress: 1,
-            ocrDone: true,
-            source: "transcript",
-          }));
-        capturedRef.push(...transcriptFrames);
-        totalExpected = transcriptFrames.length;
-        setYtSource("transcript");
-        setYtDownloadStatus("done");
-        setYtExtractStatus("done");
-        setYtTotalFrames(transcriptFrames.length);
-        setYtDuration(d.duration);
-        setStatFrames(transcriptFrames.length);
-        setStatOcr(transcriptFrames.length);
-        setProgress(100);
-        setPhase(`Public captions received (${transcriptFrames.length} segments).`);
-      });
-
-      sse.addEventListener("frame", (e: MessageEvent) => {
-        if (cancelRef.current) { sse.close(); resolve(); return; }
-        const d = JSON.parse(e.data) as { index: number; timestamp: number; data: string };
-        setYtSource("video");
-        const frame: Frame = {
-          id: `yt-${d.timestamp.toFixed(2)}`,
-          timestamp: d.timestamp,
-          thumb: d.data,
-          hash: "",
-          text: "",
-          ocrProgress: 0,
-          ocrDone: false,
-          source: "video",
-        };
-        capturedRef.push(frame);
-        setStatFrames(capturedRef.length);
-        const pct = totalExpected > 0 ? Math.round((capturedRef.length / totalExpected) * 30) : 0;
-        setProgress(50 + pct);
-        setPhase(`Receiving frames (${capturedRef.length}/${totalExpected || "?"})`);
-      });
-
-      sse.addEventListener("done", () => {
-        if (capturedRef.length > 0 && capturedRef[0]?.source === "transcript") {
-          setFrames([...capturedRef]);
-          setStatFrames(capturedRef.length);
-          setStatOcr(capturedRef.length);
-          setPhase(`Done. Used public captions from YouTube (${capturedRef.length} segments).`);
-          setProgress(100);
-        }
-        sse.close();
-        sseRef.current = null;
-        resolve();
-      });
-
-      sse.addEventListener("error", (e: MessageEvent) => {
-        // This fires on both SSE protocol errors AND custom "error" events
-        // Check if it has data (custom event) vs network error (no data)
-        hadError = true;
-        if (e.data) {
-          const d = JSON.parse(e.data) as { step: string; message: string };
-          setYtDownloadStatus("error");
-          setYtExtractStatus("error");
-          setYtErrorStep(d.step);
-          setYtErrorMsg(d.message);
-          setYtVideoError(d.message);
-          setPhase(`Failed: ${d.message}`);
-        } else {
-          // Network-level SSE error (e.g. server crash)
-          const msg = "Connection to server was lost. Please try again.";
-          setYtDownloadStatus("error");
-          setYtErrorStep("connection");
-          setYtErrorMsg(msg);
-          setYtVideoError(msg);
-          setPhase("Connection lost.");
-        }
-        sse.close();
-        sseRef.current = null;
-        resolve();
-      });
-    });
-
-    // Transcript chunks are already text; skip browser OCR and use them directly.
-    if (capturedRef.length > 0 && capturedRef[0]?.source === "transcript") {
-      setFrames([...capturedRef]);
-      setStatFrames(capturedRef.length);
-      setStatOcr(capturedRef.length);
-      setProcessing(false);
-      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
-      setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
-      return;
-    }
-
-    // ── Step 3: Run OCR on all collected frames ───────────────────────────────
-    if (cancelRef.current || capturedRef.length === 0) {
-      if (cancelRef.current) {
-        setPhase("Cancelled.");
-      } else if (capturedRef.length === 0 && !hadError) {
-        // hadError (not ytErrorMsg) to avoid the stale-closure problem —
-        // React state updates are async, so ytErrorMsg here would still be ""
-        // even if setYtErrorMsg was called inside the SSE promise above.
-        setYtErrorMsg("No frames were received from the server.");
-        setPhase("No frames received.");
-      }
-      setProcessing(false);
-      if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
-      return;
-    }
-
-    setFrames([...capturedRef]);
-    setPhase(`Running OCR on ${capturedRef.length} frame(s) (${NUM_OCR_WORKERS} workers)`);
-    setProgress(80);
-
-    const workers = await Promise.all(
-      Array.from({ length: Math.min(NUM_OCR_WORKERS, capturedRef.length) }, () =>
-        Tesseract.createWorker("eng"),
-      ),
-    );
-
-    try {
-      for (let i = 0; i < capturedRef.length; i += workers.length) {
-        if (cancelRef.current) break;
-        await Promise.all(
-          capturedRef.slice(i, i + workers.length).map(async (f, j) => {
-            const idx = i + j;
-            if (idx >= capturedRef.length) return;
-            try {
-              const result = await workers[j].recognize(f.thumb);
-              capturedRef[idx] = {
-                ...capturedRef[idx],
-                text: (result.data.text || "").trim(),
-                ocrProgress: 1,
-                ocrDone: true,
-              };
-            } catch {
-              capturedRef[idx] = { ...capturedRef[idx], text: "", ocrProgress: 1, ocrDone: true };
-            }
-          }),
-        );
-        setFrames([...capturedRef]);
-        const done = capturedRef.filter((f) => f.ocrDone).length;
-        setStatOcr(done);
-        setProgress(80 + Math.round((done / capturedRef.length) * 20));
-      }
-    } finally {
-      await Promise.all(workers.map((w) => w.terminate()));
-    }
-
-    if (elapsedTimerRef.current) window.clearInterval(elapsedTimerRef.current);
-    setStatElapsed(Math.round((Date.now() - processingStartRef.current) / 1000));
-
-    const filtered = capturedRef.filter((f) => f.text.replace(/\s+/g, "").length >= 8);
-    setFrames(filtered);
-    setStatFrames(filtered.length);
-    setPhase(
-      filtered.length
-        ? `Done. ${filtered.length} frame(s) with text.`
-        : "Done. No readable text found.",
-    );
-    setProcessing(false);
-  }
-
   async function startProcessing() {
-    // Route to server-side processing for YouTube URLs
-    if (youtubeUrl && ytVideoId) {
-      await startYouTubeProcessing();
-      return;
-    }
     if (!videoRef.current || !videoUrl) return;
     const video = videoRef.current;
     if (!video.duration || isNaN(video.duration)) {
@@ -1003,7 +618,7 @@ export default function App() {
     return undefined;
   }, [generatingNotes, notes]);
 
-  const showHero = !videoFile && !youtubeUrl && frames.length === 0 && !notes;
+  const showHero = !videoFile && frames.length === 0 && !notes;
   const wordCount = notes ? notes.split(/\s+/).filter(Boolean).length : 0;
   const readingTime = Math.max(1, Math.ceil(wordCount / 200));
 
@@ -1045,7 +660,7 @@ export default function App() {
             {/* Badge */}
             <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-primary/25 bg-primary/8 text-primary text-xs font-medium mb-6">
               <Sparkles className="w-3 h-3" />
-              AI-Powered · Works with YouTube &amp; Video Files
+              AI-Powered · Works with Your Lecture Video Files
             </div>
 
             {/* Headline */}
@@ -1057,14 +672,14 @@ export default function App() {
             </h2>
 
             <p className="text-base sm:text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed mb-10">
-              Upload a lecture video or paste a YouTube link. AI captures every slide, reads the text,
+              Upload a lecture video. AI captures every slide, reads the text,
               and generates structured study notes instantly.
             </p>
 
             {/* How it works — 4 step cards */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-10">
               {[
-                { icon: <Upload className="w-5 h-5" />, step: 1, title: "Upload Lecture", desc: "Upload a video file or paste any YouTube link" },
+                { icon: <Upload className="w-5 h-5" />, step: 1, title: "Upload Lecture", desc: "Upload your lecture video file (MP4, WebM, MOV)" },
                 { icon: <Layers className="w-5 h-5" />, step: 2, title: "AI Extracts Slides", desc: "Captures frames and reads text with smart OCR" },
                 { icon: <Brain className="w-5 h-5" />, step: 3, title: "Generates Notes", desc: "AI writes structured notes in your chosen mode" },
                 { icon: <GraduationCap className="w-5 h-5" />, step: 4, title: "Study Smarter", desc: "Read, export, quiz, or create flashcards instantly" },
@@ -1112,9 +727,9 @@ export default function App() {
                 <span className="w-5 h-5 rounded-full bg-primary text-primary-foreground text-[11px] font-bold grid place-items-center flex-shrink-0">1</span>
                 Add your video
               </h2>
-              {(videoFile || youtubeUrl) && (
+              {videoFile && (
                 <button
-                  onClick={() => { reset(); setVideoFile(null); setYoutubeUrl(""); }}
+                  onClick={() => { reset(); setVideoFile(null); }}
                   className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition"
                 >
                   <X className="w-3 h-3" /> Change
@@ -1122,10 +737,10 @@ export default function App() {
               )}
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3">
               {/* File upload with drag & drop */}
               <label
-                className={classNames("cursor-pointer group", youtubeUrl && "opacity-50 pointer-events-none")}
+                className="cursor-pointer group"
                 onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
                 onDragLeave={() => setDragOver(false)}
                 onDrop={(e) => {
@@ -1133,15 +748,14 @@ export default function App() {
                   setDragOver(false);
                   const f = e.dataTransfer.files?.[0];
                   if (f && f.type.startsWith("video/")) {
-                    setYoutubeUrl("");
                     reset();
                     setVideoFile(f);
                     if (!title) setTitle(f.name.replace(/\.[^.]+$/, ""));
                   }
                 }}
               >
-                <input type="file" accept="video/*" className="hidden" disabled={!!youtubeUrl}
-                  onChange={(e) => { setYoutubeUrl(""); onPickFile(e); }}
+                <input type="file" accept="video/*" className="hidden"
+                  onChange={onPickFile}
                 />
                 <div className={classNames(
                   "rounded-xl border-2 border-dashed transition-all duration-200 p-5 flex flex-col items-center justify-center gap-2 text-center min-h-[112px]",
@@ -1172,124 +786,10 @@ export default function App() {
                   )}
                 </div>
               </label>
-
-              {/* YouTube input */}
-              <div className={classNames(
-                "rounded-xl border-2 transition-all duration-200 p-4 flex flex-col gap-3 min-h-[112px] justify-center",
-                videoFile ? "opacity-50 pointer-events-none border-border bg-card" :
-                youtubeUrl ? "border-red-400/50 bg-red-500/5" :
-                "border-border bg-card hover:border-red-400/40",
-              )}>
-                <div className="flex items-center gap-2">
-                  <Youtube className="w-5 h-5 text-red-500 shrink-0" />
-                  <p className="text-sm font-semibold">YouTube Link</p>
-                </div>
-                <div className="flex items-center gap-1.5 bg-background/50 rounded-lg border border-border/60 px-2.5 py-1.5">
-                  <input
-                    type="url" value={youtubeUrl} disabled={!!videoFile}
-                    onChange={(e) => setYoutubeUrl(e.target.value)}
-                    placeholder="https://youtube.com/watch?v=..."
-                    className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground/60"
-                  />
-                  {youtubeUrl && (
-                    <button onClick={() => setYoutubeUrl("")} className="text-muted-foreground hover:text-foreground flex-shrink-0">
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-              </div>
             </div>
 
-            {!videoFile && !youtubeUrl && (
-              <p className="mt-2 text-[11px] text-muted-foreground text-center">
-                Use one source at a time — uploading a file disables the link, and vice versa.
-              </p>
-            )}
-
-            {/* YouTube meta / status */}
-            {youtubeUrl && (
-              <div className="mt-3 space-y-2">
-                {ytMetaLoading && (
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Fetching video info...
-                  </div>
-                )}
-                {ytMeta && (
-                  <div className="flex items-center gap-3 rounded-xl border border-border bg-card p-3">
-                    <img src={ytMeta.thumbnail} alt="thumbnail" className="w-20 h-12 rounded-lg object-cover shrink-0" />
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium truncate">{ytMeta.title}</p>
-                      <p className="text-xs text-muted-foreground">{ytMeta.channel}</p>
-                    </div>
-                  </div>
-                )}
-                {ytMetaError && <p className="text-xs text-destructive font-medium">{ytMetaError}</p>}
-                {ytMeta && !ytMetaError && ytDownloadStatus === "idle" && (
-                  <p className="text-[11px] text-muted-foreground">
-                    ✓ Video ready — click <span className="text-foreground font-medium">Start Processing</span> to extract slides.
-                  </p>
-                )}
-                {ytVideoId && processing && (
-                  <div className="rounded-xl border border-border bg-card/60 p-3 text-[11px] space-y-2">
-                    <p className="text-[11px] text-muted-foreground font-semibold tracking-wide uppercase">Processing status</p>
-                    <div className="space-y-1">
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">Download</span>
-                        <span className={ytDownloadStatus === "error" ? "text-destructive" : ytDownloadStatus === "done" ? "text-emerald-500" : ytDownloadStatus === "downloading" ? "text-yellow-500" : "text-muted-foreground"}>
-                          {ytDownloadStatus === "idle" ? "Waiting" : ytDownloadStatus === "downloading" ? `${Math.round(ytDownloadPct)}%` : ytDownloadStatus === "done" ? "Complete" : "Error"}
-                        </span>
-                      </div>
-                      {ytDownloadStatus === "downloading" && (
-                        <div className="w-full h-1.5 rounded-full bg-border overflow-hidden">
-                          <div className="h-full bg-yellow-500 rounded-full transition-all duration-300" style={{ width: `${ytDownloadPct}%` }} />
-                        </div>
-                      )}
-                    </div>
-                    <div className="space-y-1">
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">Frame extraction</span>
-                        <span className={ytExtractStatus === "error" ? "text-destructive" : ytExtractStatus === "done" ? "text-emerald-500" : ytExtractStatus === "extracting" ? "text-yellow-500" : "text-muted-foreground"}>
-                          {ytExtractStatus === "idle" ? "Waiting" : ytExtractStatus === "extracting" ? `${statFrames}${ytTotalFrames > 0 ? `/${ytTotalFrames}` : ""} frames` : ytExtractStatus === "done" ? `${statFrames} frames` : "Error"}
-                        </span>
-                      </div>
-                      {ytExtractStatus === "extracting" && ytTotalFrames > 0 && (
-                        <div className="w-full h-1.5 rounded-full bg-border overflow-hidden">
-                          <div className="h-full bg-yellow-500 rounded-full transition-all duration-300" style={{ width: `${Math.round((statFrames / ytTotalFrames) * 100)}%` }} />
-                        </div>
-                      )}
-                    </div>
-                    {ytDuration > 0 && (
-                      <div className="flex justify-between"><span className="text-muted-foreground">Duration</span><span>{formatTime(ytDuration)}</span></div>
-                    )}
-                    {ytErrorMsg && (
-                      <div className="mt-2 p-3.5 rounded-xl border border-destructive/30 bg-destructive/8 space-y-2 text-left">
-                        <p className="text-xs font-semibold text-destructive break-words flex items-center gap-1.5">
-                          ⚠️ {ytErrorMsg}
-                        </p>
-                        <p className="text-[11px] text-muted-foreground leading-relaxed">
-                          YouTube is blocking automated requests from this IP. You can download the video file (or use any local MP4/WebM lecture) and process it instantly with 100% privacy.
-                        </p>
-                        <div className="pt-1 flex flex-wrap gap-2">
-                          <button
-                            onClick={() => {
-                              setYoutubeUrl("");
-                              const input = document.querySelector<HTMLInputElement>("input[type='file']");
-                              if (input) input.click();
-                            }}
-                            className="px-3 py-1.5 rounded-lg bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 shadow-sm transition"
-                          >
-                            📁 Upload Local Video File
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
             {/* File video preview */}
-            {videoUrl && !youtubeUrl && (
+            {videoUrl && (
               <div className="mt-4">
                 <video ref={videoRef} src={videoUrl} controls className="w-full rounded-xl bg-black aspect-video"
                   crossOrigin="anonymous" preload="metadata"
@@ -1297,7 +797,6 @@ export default function App() {
                 />
               </div>
             )}
-            {videoUrl && youtubeUrl && <video ref={videoRef} src="" className="hidden" />}
 
             <div className="mt-4">
               <input type="text" value={title} onChange={(e) => setTitle(e.target.value)}
@@ -1327,9 +826,6 @@ export default function App() {
                     <p>0–30 min → 10 s &nbsp;|&nbsp; 30–60 min → 15 s &nbsp;|&nbsp; 60+ min → 20 s</p>
                     {videoKnownDuration > 0 && (
                       <p className="text-foreground font-medium">This video ({formatTime(videoKnownDuration)}): will use {getAdaptiveInterval(videoKnownDuration)}s → ~{Math.ceil(videoKnownDuration / getAdaptiveInterval(videoKnownDuration))} frames</p>
-                    )}
-                    {ytMeta && ytDuration > 0 && (
-                      <p className="text-foreground font-medium">YouTube ({formatTime(ytDuration)}): server will use {getAdaptiveInterval(ytDuration)}s</p>
                     )}
                   </div>
                 )}
@@ -1404,7 +900,7 @@ export default function App() {
             <div className="mt-5 flex flex-wrap gap-2">
               {!processing ? (
                 <button onClick={startProcessing}
-                  disabled={!videoUrl && !(youtubeUrl && ytVideoId && ytMeta && !ytMetaLoading)}
+                  disabled={!videoUrl}
                   className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground font-medium shadow hover:opacity-95 hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed transition-all"
                 >
                   <Play className="w-4 h-4" /> Start Processing
@@ -1427,10 +923,10 @@ export default function App() {
               )}
             </div>
 
-            {!videoUrl && !youtubeUrl && (
+            {!videoUrl && (
               <p className="mt-3 text-xs text-muted-foreground">Add a video above to enable processing.</p>
             )}
-            {(videoUrl || youtubeUrl) && frames.length === 0 && !processing && (
+            {videoUrl && frames.length === 0 && !processing && (
               <p className="mt-3 text-xs text-muted-foreground">
                 Click <span className="text-foreground font-medium">Start Processing</span> to capture frames, then <span className="text-foreground font-medium">Generate Notes</span> will activate.
               </p>
@@ -1495,9 +991,9 @@ export default function App() {
             <div className="glass rounded-2xl p-4 sm:p-5">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="font-semibold">
-                  {ytSource === "transcript" ? "Public captions" : "Captured frames"}{" "}
+                  Captured frames{" "}
                   <span className="text-xs text-muted-foreground font-normal">
-                    ({frames.length} {ytSource === "transcript" ? "caption segments" : "unique"} · {totalText.toLocaleString()} chars {ytSource === "transcript" ? "transcript" : "OCR"})
+                    ({frames.length} unique · {totalText.toLocaleString()} chars OCR)
                   </span>
                 </h2>
               </div>
@@ -1587,12 +1083,12 @@ export default function App() {
                     {exportOpen && (
                       <div className="absolute right-0 mt-1 w-40 bg-card border border-border rounded-xl shadow-lg z-20 py-1 overflow-hidden" onMouseLeave={() => setExportOpen(false)}>
                         {[
-                          { label: "Markdown (.md)", action: () => downloadFile(getExportFileName(title, ytMeta?.title, notes, generatedMode, ".md"), notes) },
-                          { label: "Plain text (.txt)", action: () => exportTxt(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".txt").replace(/\.txt$/, "")) },
-                          { label: "Word (.docx)", action: () => exportDocx(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".docx").replace(/\.docx$/, "")) },
-                          { label: "PDF (.pdf)", action: () => exportPdf(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".pdf"), title || ytMeta?.title, generatedMode) },
-                          { label: "Preview PDF", action: () => previewPdf(notes, title || ytMeta?.title) },
-                          { label: "Anki flashcards", action: () => exportAnki(notes, getExportFileName(title, ytMeta?.title, notes, generatedMode, ".tsv").replace(/\.tsv$/, "")) },
+                          { label: "Markdown (.md)", action: () => downloadFile(getExportFileName(title, undefined, notes, generatedMode, ".md"), notes) },
+                          { label: "Plain text (.txt)", action: () => exportTxt(notes, getExportFileName(title, undefined, notes, generatedMode, ".txt").replace(/\.txt$/, "")) },
+                          { label: "Word (.docx)", action: () => exportDocx(notes, getExportFileName(title, undefined, notes, generatedMode, ".docx").replace(/\.docx$/, "")) },
+                          { label: "PDF (.pdf)", action: () => exportPdf(notes, getExportFileName(title, undefined, notes, generatedMode, ".pdf"), title, generatedMode) },
+                          { label: "Preview PDF", action: () => previewPdf(notes, title) },
+                          { label: "Anki flashcards", action: () => exportAnki(notes, getExportFileName(title, undefined, notes, generatedMode, ".tsv").replace(/\.tsv$/, "")) },
                         ].map(({ label, action }) => (
                           <button key={label} onClick={() => { action(); setExportOpen(false); }} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-secondary transition">{label}</button>
                         ))}
@@ -1698,7 +1194,7 @@ export default function App() {
                   <div>
                     <p className="font-semibold text-foreground mb-3">No notes yet.</p>
                     <ol className="text-xs text-muted-foreground space-y-1.5 text-left list-decimal pl-4">
-                      <li>Upload a video file or paste a YouTube link.</li>
+                      <li>Upload a lecture video file.</li>
                       <li>Pick a capture interval (Auto is recommended).</li>
                       <li>Click <span className="text-foreground font-medium">Start Processing</span>.</li>
                       <li>Choose a notes mode.</li>
@@ -1715,7 +1211,7 @@ export default function App() {
               {/* Notes content */}
               {!generatingNotes && notes && (
                 mode === "quiz" && quizViewMode === "interactive" ? (
-                  <InteractiveQuiz quizMarkdown={notes} title={title || ytMeta?.title || "Practice Quiz"} />
+                  <InteractiveQuiz quizMarkdown={notes} title={title || "Practice Quiz"} />
                 ) : (
                   <div key={notes.length} className="prose-notes text-sm notes-fade-in">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{notes}</ReactMarkdown>
@@ -1737,7 +1233,7 @@ export default function App() {
             <span className="font-semibold text-sm">Smart Lecture Notes</span>
           </div>
           <p className="text-[11px] text-muted-foreground text-center">
-            AI-powered · YouTube &amp; video files · 6 note modes · Export to Markdown, DOCX &amp; Anki
+            AI-powered · Video files · 6 note modes · Export to Markdown, DOCX &amp; Anki
           </p>
           <p className="text-[11px] text-muted-foreground">Powered by GPT</p>
         </div>
